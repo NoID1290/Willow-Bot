@@ -1,0 +1,911 @@
+{
+  "model": "gemma4:12b-it-qat",
+  "full_loop": false,
+  "context": 8192,
+  "output_tokens": 1024,
+  "passed": 10,
+  "total": 12,
+  "avg_latency_s": 6.408,
+  "warm_avg_latency_s": 6.218,
+  "actor_under_3s_warm": false,
+  "invalid_actions_count": 0,
+  "rejected_actions_count": 0,
+  "invalid_skills_count": 0,
+  "vram_used_mib": 0,
+  "ollama_ps_output": "NAME    ID    SIZE    PROCESSOR    CONTEXT    UNTIL",
+  "ollama_residency": {
+    "models": []
+  },
+  "cases": [
+    {
+      "case": "start_without_supplies_t0",
+      "passed": true,
+      "seconds": 8.496,
+      "prompt_tokens": 5888,
+      "generated_tokens": 384,
+      "prompt_tps": 1586.6,
+      "gen_tps": 49.2,
+      "decision": {
+        "action": "mine",
+        "target": "minecraft:oak_log",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "Gather wood and establish a safe survival base.",
+        "say": "I see a tree nearby. Time to get some wood.",
+        "memory": "Started by mining oak logs.",
+        "waypoint": "first_spawn",
+        "plan": [
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:stick",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:oak_planks",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "place",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:wooden_pickaxe",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          }
+        ],
+        "id": "e838d3ea-6982-4140-bd23-53ae26c59b4a",
+        "watch": []
+      }
+    },
+    {
+      "case": "start_without_supplies_t1",
+      "passed": true,
+      "seconds": 7.749,
+      "prompt_tokens": 5888,
+      "generated_tokens": 384,
+      "prompt_tps": 2243.1,
+      "gen_tps": 49.4,
+      "decision": {
+        "action": "mine",
+        "target": "minecraft:oak_log",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "Gather wood and establish a safe survival base.",
+        "say": "Found some wood. Let's get started.",
+        "memory": "Mining initial oak log at 3,65,1.",
+        "waypoint": "first_spawn",
+        "plan": [
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:stick",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:wooden_pickaxe",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:stone",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:stone",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          }
+        ],
+        "id": "048e0b90-e0b0-4966-8cb1-e044f8451b18",
+        "watch": []
+      }
+    },
+    {
+      "case": "craft_first_table_t0",
+      "passed": true,
+      "seconds": 5.824,
+      "prompt_tokens": 5888,
+      "generated_tokens": 384,
+      "prompt_tps": 2698.0,
+      "gen_tps": 49.5,
+      "decision": {
+        "action": "craft",
+        "target": "minecraft:crafting_table",
+        "x": 0,
+        "y": 65,
+        "z": 0,
+        "goal": "Gather wood and establish a safe survival base.",
+        "say": "Crafting a crafting table as requested.",
+        "memory": "Crafted crafting table at first_spawn.",
+        "waypoint": "first_spawn",
+        "plan": [
+          {
+            "action": "craft",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "explore",
+            "target": "0,0,0",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "goto",
+            "target": "0,0,0",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          }
+        ],
+        "id": "faf0bf56-29fa-4fd2-bfdf-c69f7435a3b2",
+        "watch": []
+      }
+    },
+    {
+      "case": "craft_first_table_t1",
+      "passed": true,
+      "seconds": 5.294,
+      "prompt_tokens": 5888,
+      "generated_tokens": 384,
+      "prompt_tps": 3038.4,
+      "gen_tps": 49.7,
+      "decision": {
+        "action": "craft",
+        "target": "minecraft:crafting_table",
+        "x": 0,
+        "y": 65,
+        "z": 0,
+        "goal": "Craft a crafting table now.",
+        "say": "Crafting table ready for use.",
+        "memory": "",
+        "waypoint": "first_spawn",
+        "plan": [
+          {
+            "action": "craft",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "explore",
+            "target": "oak_log",
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "action": "pickup",
+            "target": "oak_log",
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "action": "pickup",
+            "target": "oak_log",
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:sticks",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:wooden_pickaxe",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          }
+        ],
+        "id": "3f84b7f1-2e2c-443f-a8b5-e76e3e30ee73",
+        "watch": []
+      }
+    },
+    {
+      "case": "craft_pickaxe_t0",
+      "passed": true,
+      "seconds": 4.686,
+      "prompt_tokens": 5888,
+      "generated_tokens": 384,
+      "prompt_tps": 3257.5,
+      "gen_tps": 49.4,
+      "decision": {
+        "action": "craft",
+        "target": "minecraft:wooden_pickaxe",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "Craft a wooden pickaxe.",
+        "say": "I'll make the wooden pickaxe now to start gathering stone.",
+        "memory": ":[],",
+        "waypoint": ":",
+        "plan": [
+          {
+            "action": "craft",
+            "target": "minecraft:wooden_pickaxe",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:stone",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:stone",
+            "x": 3,
+            "y": 64,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:stone",
+            "x": 3,
+            "y": 63,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:stone",
+            "x": 3,
+            "y": 62,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:stone",
+            "x": 3,
+            "y": 61,
+            "z": 1
+          }
+        ],
+        "id": "a9fc90da-1983-44b0-a788-17a87cf529bd",
+        "watch": []
+      }
+    },
+    {
+      "case": "craft_pickaxe_t1",
+      "passed": true,
+      "seconds": 7.02,
+      "prompt_tokens": 5888,
+      "generated_tokens": 384,
+      "prompt_tps": 3490.6,
+      "gen_tps": 49.4,
+      "decision": {
+        "action": "craft",
+        "target": "minecraft:wooden_pickaxe",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "Craft a wooden pickaxe.",
+        "say": "Crafting the wooden pickaxe now.",
+        "memory": "Crafted wooden pickaxe from the crafting table.",
+        "waypoint": "table",
+        "plan": [
+          {
+            "action": "craft",
+            "target": "minecraft:wooden_pickaxe",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:stone",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:cobblestone",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:stone",
+            "x": 3,
+            "y": 65,
+            "z": 2
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:cobblestone",
+            "x": 3,
+            "y": 65,
+            "z": 2
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:stone",
+            "x": 3,
+            "y": 65,
+            "z": 3
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:cobblestone",
+            "x": 3,
+            "y": 65,
+            "z": 3
+          }
+        ],
+        "id": "4c233271-495d-45f6-8e43-9af91df59bb8",
+        "watch": []
+      }
+    },
+    {
+      "case": "eat_when_hungry_t0",
+      "passed": false,
+      "seconds": 5.797,
+      "prompt_tokens": 5888,
+      "generated_tokens": 384,
+      "prompt_tps": 3558.7,
+      "gen_tps": 49.4,
+      "decision": {
+        "action": "mine",
+        "target": "minecraft:oak_log",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "Craft a wooden pickaxe.",
+        "say": "Starting with some wood.",
+        "memory": ":[],",
+        "waypoint": ":[],",
+        "plan": [
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:oak_log",
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:oak_planks",
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:sticks",
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "action": "place",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          }
+        ],
+        "id": "696f40f2-55b1-4157-bfb7-9328097ae0aa",
+        "watch": []
+      }
+    },
+    {
+      "case": "eat_when_hungry_t1",
+      "passed": false,
+      "seconds": 5.968,
+      "prompt_tokens": 5888,
+      "generated_tokens": 384,
+      "prompt_tps": 3670.1,
+      "gen_tps": 49.4,
+      "decision": {
+        "action": "mine",
+        "target": "minecraft:oak_log",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "Craft a wooden pickaxe.",
+        "say": "I need some wood to get started. Mining this log first.",
+        "memory": ":[],",
+        "waypoint": ":[],",
+        "plan": [
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 2
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 64,
+            "z": 1
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:oak_planks",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:stick",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "place",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          }
+        ],
+        "id": "b3c6c2a9-136f-4081-ad7c-76e023158fa1",
+        "watch": []
+      }
+    },
+    {
+      "case": "reply_to_player_t0",
+      "passed": true,
+      "seconds": 5.782,
+      "prompt_tokens": 5888,
+      "generated_tokens": 384,
+      "prompt_tps": 3738.5,
+      "gen_tps": 49.5,
+      "decision": {
+        "action": "mine",
+        "target": "minecraft:oak_log",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "Craft a wooden pickaxe.",
+        "say": "Hello! I'm getting started on gathering some wood to craft my first tools.",
+        "memory": "Mining first oak log to start the wood gathering process.",
+        "waypoint": "first_spawn",
+        "plan": [
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:oak_planks",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:stick",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "place",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:wooden_pickaxe",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          }
+        ],
+        "id": "13263264-1fe1-445f-bc54-53c4cb3ccec3",
+        "watch": []
+      }
+    },
+    {
+      "case": "reply_to_player_t1",
+      "passed": true,
+      "seconds": 7.317,
+      "prompt_tokens": 5888,
+      "generated_tokens": 384,
+      "prompt_tps": 3782.6,
+      "gen_tps": 50.2,
+      "decision": {
+        "action": "mine",
+        "target": "minecraft:oak_log",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "Craft a wooden pickaxe.",
+        "say": "Hello! I'm just getting started. I'm going to gather some wood so I can make some tools.",
+        "memory": "Mining first oak log to start the wood gathering process.",
+        "waypoint": "first_spawn",
+        "plan": [
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:oak_planks",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:stick",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "place",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:wooden_pickaxe",
+            "x": 0,
+            "y": 65,
+            "z": 0
+          }
+        ],
+        "id": "9c77ec08-3d5d-4ff7-bab6-fc588d13bb86",
+        "watch": []
+      }
+    },
+    {
+      "case": "escape_circular_tree_loop_t0",
+      "passed": true,
+      "seconds": 6.866,
+      "prompt_tokens": 5888,
+      "generated_tokens": 384,
+      "prompt_tps": 3873.2,
+      "gen_tps": 50.4,
+      "decision": {
+        "action": "escape",
+        "target": "",
+        "x": 0,
+        "y": 80,
+        "z": 0,
+        "goal": "Craft a wooden pickaxe.",
+        "say": "I'm stuck in a loop. I need to find a tree to mine logs.",
+        "memory": "Current location is [0, 80, 0]. Stuck diagnosis noted.",
+        "waypoint": "last_position: [0, 80, 0]",
+        "plan": [
+          {
+            "action": "goto",
+            "target": "3,65,1",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 64,
+            "z": 1
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 64,
+            "z": 1
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:oak_planks",
+            "x": 0,
+            "y": 80,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:stick",
+            "x": 0,
+            "y": 80,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 80,
+            "z": 0
+          }
+        ],
+        "id": "bb0e7a7e-1d7e-48a6-89ce-bab1149527b5",
+        "watch": []
+      }
+    },
+    {
+      "case": "escape_circular_tree_loop_t1",
+      "passed": true,
+      "seconds": 6.1,
+      "prompt_tokens": 5888,
+      "generated_tokens": 384,
+      "prompt_tps": 3901.9,
+      "gen_tps": 50.2,
+      "decision": {
+        "action": "escape",
+        "target": "",
+        "x": 0,
+        "y": 0,
+        "z": 0,
+        "goal": "Craft a wooden pickaxe.",
+        "say": "I'm stuck circling. Moving to the oak log I spotted earlier to start gathering wood.",
+        "memory": "Moving to oak log at 3,65,1 to break the loop.",
+        "waypoint": "last_position",
+        "plan": [
+          {
+            "action": "goto",
+            "target": "",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "pickup",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "mine",
+            "target": "minecraft:oak_log",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:oak_planks",
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:stick",
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "action": "craft",
+            "target": "minecraft:crafting_table",
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          {
+            "action": "place",
+            "target": "minecraft:crafting_table",
+            "x": 3,
+            "y": 65,
+            "z": 1
+          }
+        ],
+        "id": "82f12c65-12c2-49d5-bfea-86a8f512ffc1",
+        "watch": []
+      }
+    }
+  ]
+}

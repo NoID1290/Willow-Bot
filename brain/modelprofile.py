@@ -18,11 +18,11 @@ import urllib.request
 
 DEFAULT_MODEL = "gemma4:12b-it-qat"
 DEFAULT_CONTEXT_CAP = 32768
-DEFAULT_ACTOR_TOKENS = 8192
-DEFAULT_PLAN_TOKENS = 8192
+DEFAULT_ACTOR_TOKENS = 1024
+DEFAULT_PLAN_TOKENS = 4096
 DEFAULT_PROMPT_BYTES = 20000
 DEFAULT_ACTOR_TIMEOUT = 240
-DEFAULT_PLAN_TIMEOUT = 180
+DEFAULT_PLAN_TIMEOUT = 90
 DEFAULT_PLAN_MAX_AGE = 240
 
 MIN_CONTEXT = 4096
@@ -32,7 +32,7 @@ BYTES_PER_TOKEN = 3.5
 TEMPLATE_TOKENS = 256
 PROMPT_BYTES_CAP = 131072
 PROMPT_BYTES_MIN = 6000
-SETTING_KEYS = {"contextLength", "actorTokens", "planTokens", "temperature", "think", "vision"}
+SETTING_KEYS = {"contextLength", "actorTokens", "planTokens", "temperature", "think", "vision", "strategistTemperature", "roles", "bounded_repetition"}
 
 DECISION_LIMITS = {
     "target": 96,
@@ -518,6 +518,41 @@ def validate_settings(settings):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 2:
                 raise ValueError("temperature must be between 0 and 2")
             clean[key] = float(value)
+        elif key == "strategistTemperature":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 2:
+                raise ValueError("strategistTemperature must be between 0 and 2")
+            clean[key] = float(value)
+        elif key == "bounded_repetition":
+            clean[key] = bool(value)
+        elif key == "roles":
+            if not isinstance(value, dict):
+                raise ValueError("roles must be a dictionary")
+            clean_roles = {}
+            for role_name in ("actor", "strategist"):
+                r_val = value.get(role_name)
+                if isinstance(r_val, dict):
+                    c_role = {}
+                    if "temperature" in r_val and r_val["temperature"] is not None:
+                        t = r_val["temperature"]
+                        if isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 <= t <= 2:
+                            raise ValueError(f"role {role_name} temperature must be between 0 and 2")
+                        c_role["temperature"] = float(t)
+                    if "num_predict" in r_val and r_val["num_predict"] is not None:
+                        np = r_val["num_predict"]
+                        if isinstance(np, bool) or not isinstance(np, int) or not 64 <= np <= 16384:
+                            raise ValueError(f"role {role_name} num_predict must be an integer between 64 and 16384")
+                        c_role["num_predict"] = np
+                    if "think" in r_val and r_val["think"] is not None:
+                        if r_val["think"] not in ("auto", "on", "off", True, False):
+                            raise ValueError(f"role {role_name} think must be auto, on, off, or boolean")
+                        c_role["think"] = r_val["think"]
+                    if "timeout" in r_val and r_val["timeout"] is not None:
+                        to = r_val["timeout"]
+                        if isinstance(to, bool) or not isinstance(to, (int, float)) or to <= 0:
+                            raise ValueError(f"role {role_name} timeout must be positive")
+                        c_role["timeout"] = int(to)
+                    clean_roles[role_name] = c_role
+            clean[key] = clean_roles
         else:
             if isinstance(value, bool) or not isinstance(value, int):
                 raise ValueError(f"{key} must be an integer")
@@ -635,13 +670,37 @@ def build(model, show, settings=None, hardware=None, benchmark=None):
         context_cap = 16384 if is_lfm else DEFAULT_CONTEXT_CAP
         sources["context"] = "model_metadata_cap"
 
+    measured_prompt_tps = float(bench.get("prompt_tps") or (960.0 if "12b" in model.lower() else 1800.0))
+    measured_gen_tps = float(bench.get("gen_tps") or (48.5 if "12b" in model.lower() else (230.0 if is_lfm else 85.0)))
+    measured_bpt = float(bench.get("bytes_per_token") or (BYTES_PER_TOKEN))
+    measured_bpt = max(2.5, min(5.5, measured_bpt))
+    sources["bytes_per_token"] = "measured_ollama_eval" if "bytes_per_token" in bench else "default_3.5"
+    sources["throughput"] = "measured_benchmark" if "gen_tps" in bench else "architecture_estimate"
+
     auto_context = min(trained, context_cap)
     while eff_kv_per_token and auto_context > MIN_CONTEXT and eff_kv_per_token * auto_context > kv_budget_bytes:
         auto_context //= 2
-    context = min(settings.get("contextLength", auto_context), trained, MAX_CONTEXT)
-    context = max(context, min(MIN_CONTEXT, trained))
+
     if "contextLength" in settings:
+        context = min(settings["contextLength"], trained, MAX_CONTEXT)
+        context = max(context, min(MIN_CONTEXT, trained))
         sources["context"] = "user_settings"
+    elif hw_mode:
+        # Choose ONE shared num_ctx for both roles (start at 16384, computed as max(prompt tokens + output cap)
+        # plus about 20% headroom, rounded to a power of two, capped at the trained context and hardware budget).
+        est_prompt_tokens = int(DEFAULT_PROMPT_BYTES / measured_bpt)
+        needed_tokens = int((est_prompt_tokens + max(DEFAULT_ACTOR_TOKENS, DEFAULT_PLAN_TOKENS)) * 1.2)
+        power2_ctx = 1 << (needed_tokens - 1).bit_length()
+        # Start at 16384 (or preset max_context if higher such as high_vram 32k)
+        base_ctx = max(16384, int(preset.get("max_context", 16384)))
+        derived_ctx = max(base_ctx, power2_ctx)
+        context = max(MIN_CONTEXT, min(derived_ctx, auto_context, trained, MAX_CONTEXT))
+        while eff_kv_per_token and context > MIN_CONTEXT and eff_kv_per_token * context > kv_budget_bytes:
+            context //= 2
+        sources["context"] = f"shared_role_context(needed={needed_tokens}tok -> power2={power2_ctx}, clamped={context})"
+    else:
+        context = auto_context
+        sources["context"] = "model_metadata_cap"
 
     thinking_supported = "thinking" in capabilities
     think_mode = settings.get("think", "auto")
@@ -658,13 +717,6 @@ def build(model, show, settings=None, hardware=None, benchmark=None):
         think_value = thinking
         if thinking and arch.startswith("gptoss"):
             think_value = "medium"
-
-    measured_prompt_tps = float(bench.get("prompt_tps") or (960.0 if "12b" in model.lower() else 1800.0))
-    measured_gen_tps = float(bench.get("gen_tps") or (48.5 if "12b" in model.lower() else (230.0 if is_lfm else 85.0)))
-    measured_bpt = float(bench.get("bytes_per_token") or (BYTES_PER_TOKEN))
-    measured_bpt = max(2.5, min(5.5, measured_bpt))
-    sources["bytes_per_token"] = "measured_ollama_eval" if "bytes_per_token" in bench else "default_3.5"
-    sources["throughput"] = "measured_benchmark" if "gen_tps" in bench else "architecture_estimate"
 
     if hw_mode:
         target_actor_s = float(preset.get("target_actor_latency_s", 2.5))
@@ -799,8 +851,105 @@ def build(model, show, settings=None, hardware=None, benchmark=None):
         planner_mode = "disabled"
     sources["planner_mode"] = f"single_gpu_policy({planner_mode}, num_parallel=1)"
 
+    # Configure Role-Aware parameters (actor vs strategist)
+    role_overrides = settings.get("roles") or {}
+    actor_override = role_overrides.get("actor") or {}
+    strat_override = role_overrides.get("strategist") or {}
+
+    # Actor: thinking OFF by default in hardware/auto mode, or follow settings/override
+    if "think" in actor_override:
+        actor_think_val = actor_override["think"]
+        if actor_think_val in ("on", True):
+            actor_thinking = thinking_supported
+        elif actor_think_val in ("off", False):
+            actor_thinking = False
+        else:
+            actor_thinking = False
+    elif "think" in settings and settings["think"] != "auto":
+        actor_thinking = thinking_supported and settings["think"] == "on"
+    elif hw_mode:
+        actor_thinking = False
+    else:
+        actor_thinking = thinking
+
+    actor_think_value = None
+    if thinking_supported:
+        actor_think_value = actor_thinking
+        if actor_thinking and arch.startswith("gptoss"):
+            actor_think_value = "medium"
+
+    # Strategist: thinking ON if supported (unless user explicitly sets think off), output cap 2048-4096
+    if "think" in strat_override:
+        strat_think_val = strat_override["think"]
+        if strat_think_val in ("on", True):
+            strat_thinking = thinking_supported
+        elif strat_think_val in ("off", False):
+            strat_thinking = False
+        else:
+            strat_thinking = thinking_supported
+    elif "think" in settings and settings["think"] != "auto":
+        strat_thinking = thinking_supported and settings["think"] == "on"
+    else:
+        # Default: Strategist thinking is ON if supported
+        strat_thinking = thinking_supported
+
+    strat_think_value = None
+    if thinking_supported:
+        strat_think_value = strat_thinking
+        if strat_thinking and arch.startswith("gptoss"):
+            strat_think_value = "medium"
+
+    # Temperature per role
+    actor_temp = actor_override.get("temperature", options.get("temperature"))
+    # Strategist temperature: default 0.3 for skill writing, or override
+    strat_temp = strat_override.get(
+        "temperature",
+        settings.get("strategistTemperature", 0.3 if not is_strata else 0.2)
+    )
+
+    actor_output = int(actor_override.get("num_predict", actor_tokens))
+    strat_output = int(strat_override.get("num_predict", plan_tokens))
+
+    actor_timeout = int(actor_override.get("timeout", timeouts["actor_timeout"]))
+    strat_timeout = int(strat_override.get("timeout", timeouts["plan_timeout"]))
+
+    # Token/byte calculations per role
+    actor_safety = TEMPLATE_TOKENS if not hw_mode else max(TEMPLATE_TOKENS, min(1024, context // 32))
+    actor_prompt_tokens = max(512, context - actor_output - actor_safety)
+    actor_prompt_bytes = int(min(PROMPT_BYTES_CAP, actor_prompt_tokens * measured_bpt))
+
+    strat_safety = TEMPLATE_TOKENS if not hw_mode else max(TEMPLATE_TOKENS, min(1024, context // 32))
+    strat_json_output = min(1024, strat_output) if strat_thinking else strat_output
+    strat_think_rsv = max(0, strat_output - strat_json_output) if strat_thinking else 0
+    strat_prompt_tokens = max(512, context - strat_json_output - strat_think_rsv - strat_safety)
+    strat_prompt_bytes = int(min(PROMPT_BYTES_CAP, strat_prompt_tokens * measured_bpt))
+
+    roles = {
+        "actor": {
+            "num_predict": actor_output,
+            "think": actor_thinking,
+            "think_value": actor_think_value,
+            "temperature": actor_temp,
+            "timeout": actor_timeout,
+            "prompt_tokens": actor_prompt_tokens,
+            "prompt_bytes": actor_prompt_bytes,
+            "num_ctx": context,
+        },
+        "strategist": {
+            "num_predict": strat_output,
+            "think": strat_thinking,
+            "think_value": strat_think_value,
+            "temperature": strat_temp,
+            "timeout": strat_timeout,
+            "prompt_tokens": strat_prompt_tokens,
+            "prompt_bytes": strat_prompt_bytes,
+            "num_ctx": context,
+        },
+    }
+
     return {
         "model": model,
+        "roles": roles,
         "architecture": arch,
         "family": details.get("family", arch),
         "parameter_size": details.get("parameter_size", "125B" if is_strata else ""),

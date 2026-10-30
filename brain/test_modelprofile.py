@@ -237,6 +237,40 @@ class ModelProfileTests(unittest.TestCase):
         self.assertEqual(lfm_prof["planner_mode"], "idle_only")
         self.assertTrue(lfm_prof["vision_enabled"])
 
+    def test_role_profile_derivation_and_budget_consistency(self):
+        # Verify role-aware configuration and consistency between tokens, bytes, and num_ctx
+        profile = modelprofile.build("gemma4:12b-it-qat", GEMMA4, {
+            "strategistTemperature": 0.3,
+            "roles": {
+                "actor": {"num_predict": 1024, "think": "off"},
+                "strategist": {"num_predict": 2048, "think": "on", "temperature": 0.25}
+            }
+        })
+        self.assertIn("roles", profile)
+        actor = profile["roles"]["actor"]
+        strat = profile["roles"]["strategist"]
+
+        # 1. Both roles MUST share the exact same num_ctx
+        self.assertEqual(actor["num_ctx"], strat["num_ctx"])
+        self.assertEqual(actor["num_ctx"], profile["context"])
+
+        # 2. Actor has thinking OFF and output cap 1024
+        self.assertFalse(actor["think"])
+        self.assertIs(actor["think_value"], False)
+        self.assertEqual(actor["num_predict"], 1024)
+
+        # 3. Strategist has thinking ON and specified output cap and temperature
+        self.assertTrue(strat["think"])
+        self.assertEqual(strat["num_predict"], 2048)
+        self.assertEqual(strat["temperature"], 0.25)
+
+        # 4. Token/byte budgets are consistent
+        bpt = profile["bytes_per_token"]
+        self.assertEqual(actor["prompt_bytes"], int(min(modelprofile.PROMPT_BYTES_CAP, actor["prompt_tokens"] * bpt)))
+        self.assertEqual(strat["prompt_bytes"], int(min(modelprofile.PROMPT_BYTES_CAP, strat["prompt_tokens"] * bpt)))
+        self.assertLessEqual(actor["prompt_tokens"] + actor["num_predict"], actor["num_ctx"])
+        self.assertLessEqual(strat["prompt_tokens"] + strat["num_predict"], strat["num_ctx"])
+
 
 if __name__ == "__main__":
     unittest.main()

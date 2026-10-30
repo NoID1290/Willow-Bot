@@ -21,7 +21,15 @@ import urllib.error
 import urllib.request
 import uuid
 
-from skills import SkillLibrary, normalize, parse
+from skills import (
+    SkillLibrary,
+    dry_run,
+    extract_description,
+    normalize,
+    parse,
+    rank_skills,
+    retrieve_few_shot_examples,
+)
 from experience import Experience, inventory
 from memory import Memory
 import modelprofile
@@ -1006,6 +1014,11 @@ class Brain:
             gen_tps=profile["gen_tps"],
             is_strata=bool(profile.get("is_strata")),
         )
+        if "roles" in profile:
+            if "actor" in profile["roles"]:
+                profile["roles"]["actor"]["timeout"] = profile["timeouts"]["actor_timeout"]
+            if "strategist" in profile["roles"]:
+                profile["roles"]["strategist"]["timeout"] = profile["timeouts"]["plan_timeout"]
 
     def inference(self, messages, schema, role, output=None, timeout=None, images=None):
         with self._inference_lock:
@@ -1022,14 +1035,18 @@ class Brain:
 
     def _run_inference(self, messages, schema, role, output=None, timeout=None, images=None):
         started = time.monotonic()
+        profile = self.ensure_profile(timeout or (self.plan_timeout if role == "strategist" else self.actor_timeout))
+        role_cfg = (profile.get("roles") or {}).get(role) or {}
+
         if timeout is None:
-            timeout = self.plan_timeout if role == "strategist" else self.actor_timeout
-        profile = self.ensure_profile(timeout)
+            timeout = role_cfg.get("timeout") or (self.plan_timeout if role == "strategist" else self.actor_timeout)
         if output is None:
-            output = profile["plan_tokens"] if role == "strategist" else profile["actor_tokens"]
+            output = role_cfg.get("num_predict") or (profile["plan_tokens"] if role == "strategist" else profile["actor_tokens"])
+        prompt_budget = role_cfg.get("prompt_bytes") or profile.get("prompt_bytes", PROMPT_BYTES)
+
         msg_bytes = len(compact(messages).encode())
         schema_bytes = len(compact(schema).encode())
-        if msg_bytes + schema_bytes > profile["prompt_bytes"]:
+        if msg_bytes + schema_bytes > prompt_budget:
             raise OSError(f"{role} prompt exceeds context budget")
         msgs = copy.deepcopy(messages)
         resp_limit = self.response_limit_bytes
@@ -1062,11 +1079,12 @@ class Brain:
                     if actions:
                         strata_schema["properties"]["action"]["enum"] = sorted(actions)
 
+            strata_temp = role_cfg.get("temperature", profile["options"].get("temperature", 0.2))
             strata_req = {
                 "model": profile.get("model", "qwen3.8-flash-next-q2_0"),
                 "messages": strata_msgs,
                 "response_format": {"type": "json_schema", "json_schema": {"name": "decision", "schema": strata_schema}},
-                "temperature": profile["options"].get("temperature", 0.2),
+                "temperature": strata_temp,
                 "max_tokens": max(1024, output),
                 "stream": False,
             }
@@ -1103,13 +1121,19 @@ class Brain:
         if images and profile.get("vision_enabled", profile.get("multimodal_capabilities", {}).get("vision")) and msgs:
             if isinstance(msgs[-1], dict) and msgs[-1].get("role") == "user":
                 msgs[-1]["images"] = images
+
+        req_options = dict(profile["options"], num_predict=output)
+        if "temperature" in role_cfg and role_cfg["temperature"] is not None:
+            req_options["temperature"] = role_cfg["temperature"]
+
         request = {
             "model": self.model, "messages": msgs, "format": schema,
             "stream": False, "keep_alive": self.keep_alive,
-            "options": dict(profile["options"], num_predict=output),
+            "options": req_options,
         }
-        if profile["think_value"] is not None:
-            request["think"] = profile["think_value"]
+        role_think_val = role_cfg.get("think_value", profile.get("think_value"))
+        if role_think_val is not None:
+            request["think"] = role_think_val
 
         def _send_ollama(req_dict):
             req_obj = urllib.request.Request(self.ollama + "/api/chat", data=compact(req_dict).encode(),
@@ -1142,6 +1166,10 @@ class Brain:
                 profile["thinking"] = False
                 profile["think_value"] = False
                 profile["actor_tokens"] = non_think_cap
+                if "actor" in (profile.get("roles") or {}):
+                    profile["roles"]["actor"]["think"] = False
+                    profile["roles"]["actor"]["think_value"] = False
+                    profile["roles"]["actor"]["num_predict"] = non_think_cap
         if payload.get("done_reason") == "length":
             raise ValueError("Model exhausted output budget; refusing partial response")
         self._update_live_metrics(profile, msg_bytes, payload)
@@ -1196,8 +1224,9 @@ class Brain:
             LOG.warning("Strategist generated invalid or oversized code; discarding code")
             value["code"] = ""
         elif value["code"]:
+            allow_bounded = bool(self.settings.get("bounded_repetition"))
             try:
-                parse(value["code"])
+                parse(value["code"], allow_bounded_repetition=allow_bounded)
             except ValueError as exc:
                 LOG.warning("Strategist generated invalid skill code: %s; discarding code", exc)
                 LOG.warning("Rejected skill source:\n%s", value["code"][:DECISION_LIMITS["code"]])
@@ -1234,7 +1263,37 @@ class Brain:
                         plan["goal"] = "Find and mine 3 cobblestone with wooden pickaxe to craft a stone pickaxe."
                         plan["reason"] = "Wooden pickaxe and ample wood/planks are already in inventory; next progression step is mining stone for cobblestone."
                     if plan["code"]:
-                        self.skills.install(plan["code"])
+                        # Task B2: Dry-run candidate skill against recent past observations before saving
+                        past_obs = []
+                        try:
+                            rows = self.db.execute(
+                                "SELECT hypothesis FROM decisions WHERE hypothesis IS NOT NULL "
+                                "AND hypothesis != '' ORDER BY created DESC LIMIT 20"
+                            ).fetchall()
+                            for (h_json,) in rows:
+                                try:
+                                    parsed = json.loads(h_json)
+                                    if isinstance(parsed, dict) and "observed" in parsed and isinstance(parsed["observed"], dict):
+                                        past_obs.append(parsed["observed"])
+                                except Exception:
+                                    continue
+                        except Exception:
+                            pass
+                        if not past_obs:
+                            # Use current observation as baseline test case
+                            past_obs = [observation]
+
+                        allow_rep = bool(self.settings.get("bounded_repetition"))
+                        passed, reason = dry_run(
+                            plan["code"], past_obs, validate_action_fn=validate_action, allow_bounded_repetition=allow_rep
+                        )
+                        if passed:
+                            self.skills.install(plan["code"], dry_run_passed=1, allow_bounded_repetition=allow_rep)
+                            LOG.info("Skill passed dry-run and installed to library")
+                        else:
+                            LOG.warning("Skill dry-run failed: %s; discarding code", reason)
+                            plan["code_error"] = f"Dry-run rejected: {reason}"
+                            plan["code"] = ""
                     with self.db:
                         self.db.execute("INSERT OR REPLACE INTO state VALUES ('strategy',?)",
                                         (compact({"goal": plan["goal"], "reason": plan["reason"]}),))
@@ -1274,10 +1333,17 @@ class Brain:
                 return
         snapshot = json.loads(messages[-1]["content"])
         scale = self.trim_scale
-        max_skills = _scaled_count(8, scale, low=2, high=16)
-        snapshot["skill_programs"] = self.skills.report()[:max_skills]
+        # Task B4: Retrieve only top 3-5 relevant skills instead of full list
+        max_skills = max(3, min(5, _scaled_count(4, scale, low=3, high=5)))
+        snapshot["skill_programs"] = self.skills.report(
+            observation=snapshot, top_k=max_skills, ollama=self.ollama
+        )
+        # Task B5: Few-shot example skills
+        snapshot["example_skills"] = retrieve_few_shot_examples(
+            snapshot, top_k=2, ollama=self.ollama
+        )
         snapshot["previous_strategy_error"] = self.strategy_error
-        list_fields = ("skill_programs", "nearby_blocks", "entities", "observed_lessons",
+        list_fields = ("skill_programs", "example_skills", "nearby_blocks", "entities", "observed_lessons",
                        "recent_actions", "memory_events", "knowledge", "remembered_resources",
                        "my_placed_blocks", "craftable", "lookup", "waypoints", "my_notes")
         cap = _scaled_count(6, scale, low=2, high=20)
@@ -1598,6 +1664,7 @@ class Brain:
                 system_prompt = SYSTEM_COMPACT
 
             while True:
+                # Cache-friendly prompt ordering: static instructions/rules first, volatile observation last
                 messages = [{"role": "system", "content": system_prompt},
                             {"role": "user", "content": compact(context)}]
                 if len(compact(messages).encode()) + schema_bytes <= self.prompt_bytes:

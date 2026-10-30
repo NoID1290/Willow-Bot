@@ -2,11 +2,13 @@
 
 import ast
 import hashlib
+import json
 import logging
 from pathlib import Path
 import re
 import textwrap
 import time
+import urllib.request
 
 LOG = logging.getLogger("localai")
 SEED = "def skill():\n    return foundation()\n"
@@ -45,6 +47,215 @@ HINTS = {
 }
 
 
+def extract_description(code):
+    """Extract a one-line description from docstring, leading comment, or return statement."""
+    if not isinstance(code, str):
+        return "Skill program"
+    # Check docstring inside def skill():
+    m = re.search(r'def\s+skill\s*\(\s*\)\s*:\s*(?:"""|\'\'\')(.*?)(?:"""|\'\'\')', code, re.S)
+    if m:
+        line = m.group(1).strip().splitlines()[0].strip()
+        if line:
+            return line[:120]
+    # Check leading comments
+    for line in code.splitlines():
+        line = line.strip()
+        if line.startswith("#"):
+            comment = line.lstrip("#").strip()
+            if comment:
+                return comment[:120]
+        elif line.startswith("def skill"):
+            continue
+        elif line:
+            break
+    # Fallback to action in return
+    m_ret = re.search(r'return\s+([a-zA-Z0-9_]+)\s*\((.*?)\)', code)
+    if m_ret:
+        helper, args = m_ret.group(1), m_ret.group(2).strip()
+        args = re.sub(r'["\']', '', args)
+        if args:
+            return f"{helper.capitalize()} {args}"[:120]
+        return f"{helper.capitalize()}"[:120]
+    return "Survival skill program"
+
+
+def _cosine_similarity(vec_a, vec_b):
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = sum(a * a for a in vec_a) ** 0.5
+    norm_b = sum(b * b for b in vec_b) ** 0.5
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _get_embedding(text, ollama="http://127.0.0.1:11434", timeout=2):
+    """Try local Ollama embedding models, returning vector or None."""
+    models_to_try = ["qwen3-embedding:0.6b", "nomic-embed-text-v2-moe:latest", "nomic-embed-text"]
+    for emb_model in models_to_try:
+        try:
+            req_data = json.dumps({"model": emb_model, "prompt": text[:512]}).encode("utf-8")
+            req = urllib.request.Request(f"{ollama}/api/embeddings", data=req_data,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read(65536))
+                if "embedding" in data and isinstance(data["embedding"], list):
+                    return data["embedding"]
+        except Exception:
+            continue
+    return None
+
+
+def _bm25_score(query_tokens, doc_tokens, avg_doc_len=15.0):
+    """Simple BM25/keyword overlap scoring for skill retrieval."""
+    if not query_tokens or not doc_tokens:
+        return 0.0
+    k1 = 1.2
+    b = 0.75
+    doc_len = len(doc_tokens)
+    score = 0.0
+    doc_counts = {}
+    for t in doc_tokens:
+        doc_counts[t] = doc_counts.get(t, 0) + 1
+    for q in query_tokens:
+        if q in doc_counts:
+            tf = doc_counts[q]
+            # TF weighting component of BM25
+            tf_comp = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (doc_len / avg_doc_len)))
+            score += tf_comp
+    return score
+
+
+def rank_skills(skills, observation, query="", top_k=5, ollama="http://127.0.0.1:11434"):
+    """Rank skills by relevance to observation/query using local embedding or BM25 keyword fallback."""
+    if not skills:
+        return []
+    if len(skills) <= top_k:
+        return skills
+
+    # Construct query representation
+    obs_parts = []
+    if query:
+        obs_parts.append(str(query))
+    if isinstance(observation, dict):
+        if observation.get("inventory"):
+            obs_parts.append("inventory: " + " ".join(str(i) for i in observation["inventory"][:8]))
+        if observation.get("craftable"):
+            obs_parts.append("craftable: " + " ".join(str(c) for c in observation["craftable"][:8]))
+        if observation.get("nearby_blocks"):
+            blocks = [b.get("id", "") for b in observation["nearby_blocks"] if isinstance(b, dict)]
+            obs_parts.append("nearby: " + " ".join(blocks[:8]))
+        if observation.get("chat"):
+            obs_parts.append("chat: " + " ".join(str(c) for c in observation["chat"]))
+    query_text = " ".join(obs_parts) if obs_parts else "gather survive craft mine"
+
+    # Try embedding first
+    q_emb = _get_embedding(query_text, ollama=ollama, timeout=1.5)
+    scored = []
+    if q_emb is not None:
+        for s in skills:
+            desc = s.get("description") or extract_description(s.get("code", ""))
+            s_emb = _get_embedding(desc, ollama=ollama, timeout=1.0)
+            if s_emb:
+                sim = _cosine_similarity(q_emb, s_emb)
+                scored.append((sim, s))
+            else:
+                scored.append((0.0, s))
+        if any(sc[0] > 0 for sc in scored):
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [s for _, s in scored[:top_k]]
+
+    # Fallback: tokenized keyword overlap (BM25)
+    q_tokens = [w.lower() for w in re.findall(r'[a-zA-Z0-9_]+', query_text) if len(w) > 2]
+    for s in skills:
+        desc = s.get("description") or extract_description(s.get("code", ""))
+        doc_text = f"{desc} {s.get('code', '')}"
+        doc_tokens = [w.lower() for w in re.findall(r'[a-zA-Z0-9_]+', doc_text) if len(w) > 2]
+        score = _bm25_score(q_tokens, doc_tokens)
+        scored.append((score, s))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [s for _, s in scored[:top_k]]
+
+
+EXAMPLE_SKILLS = [
+    {
+        "description": "Mine cobblestone when wooden pickaxe is owned and stone is nearby",
+        "code": textwrap.dedent('''\
+            def skill():
+                """Mine cobblestone when wooden pickaxe is owned and stone is nearby."""
+                if count("#pickaxes") > 0 and count("#cobblestone") < 16 and nearby("minecraft:stone"):
+                    return mine("minecraft:stone")
+                return None
+        '''),
+    },
+    {
+        "description": "Craft wooden planks when logs are available and planks needed",
+        "code": textwrap.dedent('''\
+            def skill():
+                """Craft wooden planks when logs are available and planks needed."""
+                if count("#logs") > 0 and count("#planks") < 8:
+                    if can_craft("minecraft:oak_planks"):
+                        return craft("minecraft:oak_planks")
+                return None
+        '''),
+    },
+    {
+        "description": "Smelt iron ore in furnace when fuel and raw ore are available",
+        "code": textwrap.dedent('''\
+            def skill():
+                """Smelt iron ore in furnace when fuel and raw ore are available."""
+                if count("#raw_ores") > 0 and count("#fuels") > 0 and furnace_reachable():
+                    return smelt("minecraft:raw_iron")
+                return None
+        '''),
+    },
+]
+
+
+def retrieve_few_shot_examples(observation, query="", top_k=2, ollama="http://127.0.0.1:11434"):
+    """Retrieve 2-3 relevant few-shot example skills for the strategist prompt."""
+    return rank_skills(EXAMPLE_SKILLS, observation, query=query, top_k=top_k, ollama=ollama)
+
+
+def dry_run(code, observations, validate_action_fn=None, allow_bounded_repetition=False):
+    """Run candidate skill in interpreter against N past observations.
+    
+    Accepts only if it never throws and every returned action passes validate_action_fn (if given).
+    Returns (True, "Dry run passed") or (False, error_reason).
+    """
+    try:
+        body = parse(code, allow_bounded_repetition=allow_bounded_repetition)
+    except Exception as exc:
+        return False, f"Validation error during parse: {exc}"
+
+    if not observations:
+        return True, "No past observations to dry-run"
+
+    for idx, obs in enumerate(observations):
+        try:
+            val = interpret(body, obs, allow_bounded_repetition=allow_bounded_repetition)
+            if val is not None:
+                if isinstance(val, list):
+                    if not allow_bounded_repetition:
+                        return False, f"Observation {idx}: Skill returned a list of actions without bounded repetition enabled"
+                    for a_idx, act in enumerate(val):
+                        if not isinstance(act, dict):
+                            return False, f"Observation {idx} action {a_idx}: Returned item is not a dict"
+                        if validate_action_fn:
+                            validate_action_fn(act, obs)
+                elif isinstance(val, dict):
+                    if validate_action_fn:
+                        validate_action_fn(val, obs)
+                else:
+                    return False, f"Observation {idx}: Skill returned invalid type {type(val).__name__}"
+        except Exception as exc:
+            return False, f"Observation {idx}: {exc}"
+
+    return True, "Dry run passed"
+
+
 class SkillError(ValueError):
     """A validation error that names the offending line and how to fix it."""
 
@@ -77,7 +288,7 @@ def normalize(code):
     return textwrap.dedent(text).strip() + "\n" if text.strip() else ""
 
 
-def parse(code):
+def parse(code, allow_bounded_repetition=False):
     if not isinstance(code, str) or len(code.encode()) > 4096:
         raise SkillError("Skill source exceeds 4096 bytes")
     try:
@@ -85,8 +296,9 @@ def parse(code):
     except (SyntaxError, RecursionError) as exc:
         detail = f"line {exc.lineno}: {exc.msg}" if isinstance(exc, SyntaxError) and exc.lineno else "unparseable"
         raise SkillError(f"Invalid skill syntax ({detail}); return plain Python source, no markdown") from exc
-    if len(list(ast.walk(tree))) > 384:
-        raise SkillError("Skill is too large (over 384 syntax nodes); keep it short and focused")
+    max_nodes = 384 if not allow_bounded_repetition else 256
+    if len(list(ast.walk(tree))) > max_nodes:
+        raise SkillError(f"Skill is too large (over {max_nodes} syntax nodes); keep it short and focused")
     if len(tree.body) != 1:
         raise SkillError("Skill must be exactly one top-level def skill(): with nothing before or after it")
     function = tree.body[0]
@@ -115,6 +327,12 @@ def parse(code):
                                f"use '{FAKE_IDS[node.value]}'")
                 return
             fail(node, "only None, True/False, small integers and short strings are allowed as literals")
+        elif isinstance(node, ast.List) and allow_bounded_repetition:
+            if len(node.elts) > 4:
+                fail(node, "action lists under bounded repetition cannot exceed 4 items")
+            for elt in node.elts:
+                expression(elt)
+            return
         elif isinstance(node, ast.Call):
             if not isinstance(node.func, ast.Name) or node.func.id not in ARITY:
                 called = node.func.id if isinstance(node.func, ast.Name) else ast.unparse(node.func)
@@ -186,6 +404,16 @@ def parse(code):
                 expression(node.test)
                 statements(node.body)
                 statements(node.orelse)
+            elif isinstance(node, ast.For) and allow_bounded_repetition:
+                # Bounded repetition construct: for _ in range(N): where N <= 4
+                if not (isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name)
+                        and node.iter.func.id == "range" and len(node.iter.args) == 1
+                        and isinstance(node.iter.args[0], ast.Constant) and isinstance(node.iter.args[0].value, int)
+                        and 1 <= node.iter.args[0].value <= 4):
+                    fail(node, "bounded repetition allows only 'for _ in range(N):' with integer N between 1 and 4")
+                if isinstance(node.target, ast.Name):
+                    names.add(node.target.id)
+                statements(node.body)
             elif isinstance(node, ast.Return):
                 if node.value is not None:
                     expression(node.value)
@@ -203,7 +431,7 @@ def action(name, target="", position=(0, 0, 0)):
                 goal="Establish survival tools", say="", memory="")
 
 
-def interpret(body, observation):
+def interpret(body, observation, allow_bounded_repetition=False):
     inventory = {}
     for entry in observation.get("inventory", []):
         name, count = entry.rsplit("=", 1)
@@ -371,6 +599,8 @@ def interpret(body, observation):
             return variables[node.id]
         if isinstance(node, ast.Constant):
             return node.value
+        if isinstance(node, ast.List) and allow_bounded_repetition:
+            return [expression(elt) for elt in node.elts]
         if isinstance(node, ast.Call):
             return call(node.func.id, [expression(arg) for arg in node.args])
         if isinstance(node, ast.BoolOp):
@@ -434,8 +664,26 @@ def interpret(body, observation):
                 continue
             if isinstance(node, (ast.Pass, ast.Expr)):
                 continue
+            if isinstance(node, ast.For) and allow_bounded_repetition:
+                count = expression(node.iter.args[0])
+                actions = []
+                for idx in range(min(4, max(1, count))):
+                    if isinstance(node.target, ast.Name):
+                        variables[node.target.id] = idx
+                    returned, val = statements(node.body)
+                    if returned:
+                        if isinstance(val, list):
+                            actions.extend(val)
+                        elif val is not None:
+                            actions.append(val)
+                        if len(actions) >= 4:
+                            return True, actions[:4]
+                if actions:
+                    return True, actions[:4]
+                continue
             if isinstance(node, ast.Return):
-                return True, expression(node.value) if node.value else None
+                val = expression(node.value) if node.value else None
+                return True, val
             returned, value = statements(node.body if expression(node.test) else node.orelse)
             if returned:
                 return True, value
@@ -455,12 +703,36 @@ class SkillLibrary:
                failures INTEGER DEFAULT 0, disabled INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS decision_skills (decision_id TEXT PRIMARY KEY, skill_id TEXT);
         """)
-        if not db.execute("SELECT 1 FROM skills LIMIT 1").fetchone():
-            self.install(SEED, created=0)
+        # Backward-compatible migrations for existing brain.sqlite3
+        cursor = db.execute("PRAGMA table_info(skills)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        if "description" not in existing_cols:
+            try:
+                db.execute("ALTER TABLE skills ADD COLUMN description TEXT DEFAULT ''")
+            except Exception:
+                pass
+        if "status" not in existing_cols:
+            try:
+                db.execute("ALTER TABLE skills ADD COLUMN status TEXT DEFAULT 'probation'")
+            except Exception:
+                pass
+        if "dry_run_passed" not in existing_cols:
+            try:
+                db.execute("ALTER TABLE skills ADD COLUMN dry_run_passed INTEGER DEFAULT 1")
+            except Exception:
+                pass
+        # Ensure seed skill has status='active'
+        db.execute("UPDATE skills SET status='active' WHERE created=0 AND status='probation'")
+        db.commit()
 
-    def install(self, code, created=None):
-        parse(code)
+        if not db.execute("SELECT 1 FROM skills LIMIT 1").fetchone():
+            self.install(SEED, created=0, description="Default foundation gathering and survival skill")
+
+    def install(self, code, created=None, description=None, dry_run_passed=1, allow_bounded_repetition=False):
+        parse(code, allow_bounded_repetition=allow_bounded_repetition)
         key = hashlib.sha256(code.encode()).hexdigest()[:16]
+        desc = (description or extract_description(code))[:120]
+        status = "active" if created == 0 else "probation"
         if self.db.execute("SELECT 1 FROM skills WHERE id=?", (key,)).fetchone():
             return key
         path = self.directory / (key + ".py")
@@ -468,24 +740,27 @@ class SkillLibrary:
         temporary.write_text(code, encoding="utf-8")
         temporary.replace(path)
         with self.db:
-            self.db.execute("INSERT INTO skills (id,code,created) VALUES (?,?,?)",
-                            (key, code, time.time() if created is None else created))
+            self.db.execute(
+                "INSERT INTO skills (id,code,created,description,status,dry_run_passed) VALUES (?,?,?,?,?,?)",
+                (key, code, time.time() if created is None else created, desc, status, int(bool(dry_run_passed)))
+            )
             old = self.db.execute("SELECT id FROM skills WHERE created>0 ORDER BY created DESC LIMIT -1 OFFSET 15").fetchall()
             for (expired,) in old:
                 (self.directory / (expired + ".py")).unlink(missing_ok=True)
                 self.db.execute("DELETE FROM skills WHERE id=?", (expired,))
-        LOG.info("Skill installed: %s", path)
+        LOG.info("Skill installed (%s): %s - %s", status, path, desc)
         return key
 
-    def candidates(self, observation):
-        rows = self.db.execute("SELECT id,code FROM skills WHERE disabled=0 "
+    def candidates(self, observation, allow_bounded_repetition=False):
+        rows = self.db.execute("SELECT id,code,status,successes FROM skills WHERE disabled=0 "
                                "ORDER BY CASE WHEN created=0 THEN 0 ELSE 1 END, created DESC").fetchall()
-        for key, code in rows:
+        for key, code, status, successes in rows:
             try:
-                value = interpret(parse(code), observation)
+                value = interpret(parse(code, allow_bounded_repetition=allow_bounded_repetition),
+                                  observation, allow_bounded_repetition=allow_bounded_repetition)
                 if value is not None:
-                    if not isinstance(value, dict):
-                        raise ValueError("Skill must return an action or None")
+                    if not isinstance(value, (dict, list)):
+                        raise ValueError("Skill must return an action, a list of actions, or None")
                     yield key, value
             except (ValueError, TypeError, KeyError) as exc:
                 self.reject(key, str(exc))
@@ -493,7 +768,7 @@ class SkillLibrary:
     def reject(self, key, reason):
         LOG.error("Disabling invalid skill %s: %s", key, reason)
         with self.db:
-            self.db.execute("UPDATE skills SET disabled=1 WHERE id=?", (key,))
+            self.db.execute("UPDATE skills SET disabled=1, status='disabled' WHERE id=?", (key,))
 
     def outcome(self, decision_id, success):
         row = self.db.execute("SELECT skill_id FROM decision_skills WHERE decision_id=?", (decision_id,)).fetchone()
@@ -502,10 +777,21 @@ class SkillLibrary:
         key = row[0]
         field = "successes" if success else "failures"
         self.db.execute(f"UPDATE skills SET {field}={field}+1 WHERE id=?", (key,))
-        self.db.execute("UPDATE skills SET disabled=1 WHERE id=? AND failures>=3", (key,))
-        LOG.info("Skill outcome: %s success=%s (three failures disable a version)", key, success)
+        # Existing rule: 3 failures disable a version
+        self.db.execute("UPDATE skills SET disabled=1, status='disabled' WHERE id=? AND failures>=3", (key,))
+        # Task B3 Probation promotion: promote to 'active' after 2 observed successes
+        if success:
+            self.db.execute("UPDATE skills SET status='active' WHERE id=? AND successes>=2 AND status='probation'", (key,))
+        LOG.info("Skill outcome: %s success=%s (three failures disable; two successes promote)", key, success)
 
-    def report(self):
-        return [dict(id=row[0], code=row[1], successes=row[2], failures=row[3], disabled=bool(row[4]))
-                for row in self.db.execute(
-                    "SELECT id,code,successes,failures,disabled FROM skills ORDER BY created DESC LIMIT 4")]
+    def report(self, observation=None, query="", top_k=4, ollama="http://127.0.0.1:11434"):
+        all_skills = [
+            dict(id=row[0], code=row[1], successes=row[2], failures=row[3], disabled=bool(row[4]),
+                 description=row[5] or extract_description(row[1]), status=row[6] or "active")
+            for row in self.db.execute(
+                "SELECT id,code,successes,failures,disabled,description,status FROM skills ORDER BY created DESC"
+            )
+        ]
+        if not observation:
+            return all_skills[:top_k]
+        return rank_skills(all_skills, observation, query=query, top_k=top_k, ollama=ollama)

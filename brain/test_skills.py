@@ -2,6 +2,7 @@ from concurrent.futures import Future
 import json
 from pathlib import Path
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -342,6 +343,127 @@ class SkillTests(unittest.TestCase):
             b = parse(f"def skill():\n    return {call_expr}\n")
             out = interpret(b, {"inventory": ["minecraft:cobblestone=32"], "trades": ["minecraft:emerald"]})
             self.assertEqual((out["action"], out["target"]), (expected_action, expected_target))
+
+    def test_dry_run_acceptance_and_rejection(self):
+        from skills import dry_run
+
+        good_code = textwrap.dedent('''\
+            def skill():
+                """Good skill returning valid action or None."""
+                if count("#logs") > 0 and can_craft("minecraft:oak_planks"):
+                    return craft("minecraft:oak_planks")
+                return None
+        ''')
+        past_obs = [
+            {"inventory": ["minecraft:oak_log=2"], "craftable": ["minecraft:oak_planks"]},
+            {"inventory": [], "craftable": []},
+        ]
+        ok, reason = dry_run(good_code, past_obs, validate_action_fn=validate_action)
+        self.assertTrue(ok)
+        self.assertIn("passed", reason)
+
+        bad_code = textwrap.dedent('''\
+            def skill():
+                """Bad skill returning an uncraftable action."""
+                return craft("minecraft:diamond_sword")
+        ''')
+        # validate_action will reject crafting diamond_sword without craftable recipe
+        ok, reason = dry_run(bad_code, past_obs, validate_action_fn=validate_action)
+        self.assertFalse(ok)
+        self.assertIn("available recipe", reason)
+
+    def test_probation_promotion_and_failure_rule(self):
+        code = textwrap.dedent('''\
+            def skill():
+                """Probation candidate skill."""
+                return mine("minecraft:stone")
+        ''')
+        key = self.brain.skills.install(code)
+        # Should start with status 'probation'
+        row = self.brain.db.execute("SELECT status, successes, failures, disabled FROM skills WHERE id=?", (key,)).fetchone()
+        self.assertEqual(row[0], "probation")
+        self.assertEqual(row[1], 0)
+        self.assertEqual(row[3], 0)
+
+        # Associate a decision
+        dec1 = "dec-1"
+        self.brain.db.execute("INSERT INTO decision_skills VALUES (?,?)", (dec1, key))
+        # 1 success -> stays in probation
+        self.brain.skills.outcome(dec1, success=True)
+        status = self.brain.db.execute("SELECT status, successes FROM skills WHERE id=?", (key,)).fetchone()
+        self.assertEqual(status[0], "probation")
+        self.assertEqual(status[1], 1)
+
+        # 2nd success -> promoted to 'active'
+        dec2 = "dec-2"
+        self.brain.db.execute("INSERT INTO decision_skills VALUES (?,?)", (dec2, key))
+        self.brain.skills.outcome(dec2, success=True)
+        status = self.brain.db.execute("SELECT status, successes FROM skills WHERE id=?", (key,)).fetchone()
+        self.assertEqual(status[0], "active")
+        self.assertEqual(status[1], 2)
+
+        # 3 failures -> disabled
+        for i in range(3):
+            d_fail = f"dec-fail-{i}"
+            self.brain.db.execute("INSERT INTO decision_skills VALUES (?,?)", (d_fail, key))
+            self.brain.skills.outcome(d_fail, success=False)
+        disabled_row = self.brain.db.execute("SELECT disabled, status FROM skills WHERE id=?", (key,)).fetchone()
+        self.assertEqual(disabled_row[0], 1)
+        self.assertEqual(disabled_row[1], "disabled")
+
+    def test_retrieval_and_description(self):
+        from skills import extract_description, rank_skills
+
+        code_doc = textwrap.dedent('''\
+            def skill():
+                """Gather wood from nearby oak tree."""
+                return mine("minecraft:oak_log")
+        ''')
+        self.assertEqual(extract_description(code_doc), "Gather wood from nearby oak tree.")
+
+        skills_list = [
+            {"id": "wood", "code": code_doc, "description": "Gather wood from nearby oak tree."},
+            {"id": "stone", "code": 'def skill():\n    return mine("minecraft:stone")\n', "description": "Mine stone for cobblestone."},
+            {"id": "smelt", "code": 'def skill():\n    return smelt("minecraft:iron_ore")\n', "description": "Smelt raw iron in furnace."},
+            {"id": "fish", "code": 'def skill():\n    return None\n', "description": "Catch fish in river."},
+        ]
+
+        obs = {"inventory": ["minecraft:oak_log=2"], "nearby_blocks": [{"id": "minecraft:oak_log"}]}
+        ranked = rank_skills(skills_list, obs, top_k=2)
+        self.assertEqual(len(ranked), 2)
+        # Top ranked should be wood-related
+        self.assertEqual(ranked[0]["id"], "wood")
+
+    def test_corrective_retry_on_invalid_skill(self):
+        # Strategist returns invalid syntax/code on first attempt, then repairs it on retry
+        bad_response = {
+            "goal": "Build shelter",
+            "reason": "Night approaching",
+            "code": "def skill():\n    while True:\n        pass\n"
+        }
+        repaired_code = 'def skill():\n    return shelter()\n'
+        repaired_response = {
+            "goal": "Build shelter",
+            "reason": "Night approaching",
+            "code": repaired_code
+        }
+
+        call_count = 0
+        def fake_inference(messages, schema, role, timeout=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return bad_response
+            # The repair prompt must include the validation error
+            user_content = messages[-1]["content"]
+            self.assertIn("REJECTED by the validator", user_content)
+            self.assertIn("loops are not allowed", user_content)
+            return repaired_response
+
+        with patch.object(self.brain, "inference", side_effect=fake_inference):
+            plan = self.brain.think_plan([{"role": "user", "content": "{}"}])
+        self.assertEqual(call_count, 2, "Should attempt exactly one corrective retry")
+        self.assertEqual(plan["code"], repaired_code)
 
 
 if __name__ == "__main__":

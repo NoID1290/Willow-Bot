@@ -534,13 +534,40 @@ On first world startup the mod creates:
   "cinematicCamera": true,
   "stopOllamaOnExit": true,
   "modelSettings": {
+    "gemma4:12b-it-qat": {
+      "contextLength": 16384,
+      "actorTokens": 1024,
+      "planTokens": 4096,
+      "temperature": 0.2,
+      "strategistTemperature": 0.3,
+      "think": "auto",
+      "roles": {
+        "actor": { "think": "off", "num_predict": 1024 },
+        "strategist": { "think": "on", "num_predict": 2048, "temperature": 0.3 }
+      }
+    },
     "llama3:8b": { "contextLength": 8192, "actorTokens": 1024, "think": "off" }
   }
 }
 ```
 
 `modelSettings` is optional; leave it empty for full auto-detection. Any field may
-be omitted. Prefer the settings screen, which validates values against the model.
+be omitted. Supported fields include:
+- `contextLength`: shared context window (num_ctx) for both actor and strategist. Both roles always share this single window to avoid model reload thrashing in Ollama.
+- `actorTokens`: maximum tokens for actor generation (defaults to ~1024 with thinking disabled).
+- `planTokens`: maximum tokens for strategist generation (defaults to 2048-4096).
+- `temperature`: sampling temperature for actor decisions.
+- `strategistTemperature`: separate sampling temperature for strategist script writing (default 0.3).
+- `think`: "auto", "on", or "off".
+- `roles`: optional fine-grained per-role dictionary (`roles.actor` and `roles.strategist`), configuring role-specific `think`, `num_predict`, `temperature`, and `timeout`.
+- `bounded_repetition`: boolean (default `false`). When enabled, permits bounded loops (`for _ in range(N):` up to 4) and returning action lists under strict AST validation.
+
+### Multi-Slot & Parallel Inference (`OLLAMA_NUM_PARALLEL=2`)
+
+When running Ollama with parallel inference (`OLLAMA_NUM_PARALLEL=2`), Ollama allocates two KV cache slots for concurrent actor and strategist requests:
+- VRAM needed per slot: $\text{context} \times \text{KV bytes per token}$.
+- At 16K context with Q8_0 KV cache, each slot uses ~500-1000 MiB VRAM. With two parallel slots on a 12 GB GPU (such as RTX 4070 Ti), total KV cache is ~1.5-2.0 GB, leaving plenty of headroom for model weights (~7 GB) and Minecraft Iris shaders (~3.2 GB).
+- Note: Ollama system-wide environment variables (`OLLAMA_NUM_PARALLEL=2`) must be set in your systemd service or shell profile; Willow never alters system-wide Ollama settings automatically.
 
 Use the model picker or `/STOP` then `/START <model>` to change models without
 quitting. For manual file edits, close the world first. Set `chooseModelOnStart`
