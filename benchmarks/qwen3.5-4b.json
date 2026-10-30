@@ -1,0 +1,112 @@
+{
+  "model": "qwen3.5:4b",
+  "context": 4096,
+  "output_tokens": 384,
+  "passed": 3,
+  "total": 5,
+  "cases": [
+    {
+      "case": "start_without_supplies",
+      "passed": true,
+      "seconds": 3.14,
+      "decision": {
+        "action": "mine",
+        "target": "minecraft:oak_log",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "Gather wood and establish a safe survival base.",
+        "say": "",
+        "memory": "",
+        "id": "02a487ad-88f0-4094-af06-d0b9fd4e6ff6"
+      }
+    },
+    {
+      "case": "craft_first_table",
+      "passed": true,
+      "seconds": 0.89,
+      "decision": {
+        "action": "craft",
+        "target": "minecraft:crafting_table",
+        "x": 0,
+        "y": 65,
+        "z": 0,
+        "goal": "Gather wood and establish a safe survival base.",
+        "say": "Crafting table created!",
+        "memory": "",
+        "id": "4c7500f3-ac5c-4394-8c88-915d7e2acb34"
+      }
+    },
+    {
+      "case": "craft_pickaxe",
+      "passed": false,
+      "seconds": 0.88,
+      "decision": {
+        "action": "goto",
+        "target": "[3,65,1]",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "reach crafting table",
+        "say": "Heading to the crafting table.",
+        "memory": "",
+        "id": "7655c9a5-3859-4fae-9bc8-644e45b30fa5"
+      }
+    },
+    {
+      "case": "eat_when_hungry",
+      "passed": false,
+      "seconds": 0.95,
+      "decision": {
+        "action": "goto",
+        "target": "[3,65,1]",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "Gather wood and establish a safe survival base.",
+        "say": "Heading to the logs.",
+        "memory": "",
+        "id": "fe762c99-e89c-404a-87df-07adbed344a4"
+      }
+    },
+    {
+      "case": "reply_to_player",
+      "passed": true,
+      "seconds": 0.91,
+      "decision": {
+        "action": "goto",
+        "target": "3,65,1",
+        "x": 0,
+        "y": 65,
+        "z": 0,
+        "goal": "Gather wood and establish a safe survival base.",
+        "say": "Heading to the oak log!",
+        "memory": "",
+        "id": "6070c0a7-b6ad-4830-930c-c305af142a88"
+      }
+    }
+  ],
+  "ollama_residency": {
+    "models": [
+      {
+        "name": "qwen3.5:4b",
+        "model": "qwen3.5:4b",
+        "size": 3128038521,
+        "digest": "2a654d98e6fba55d452b7043684e9b57a947e393bbffa62485a7aac05ee4eefd",
+        "details": {
+          "parent_model": "",
+          "format": "gguf",
+          "family": "qwen35",
+          "families": [
+            "qwen35"
+          ],
+          "parameter_size": "4.7B",
+          "quantization_level": "Q4_K_M"
+        },
+        "expires_at": "2026-10-01T17:20:26.581619383-04:00",
+        "size_vram": 3128038521,
+        "context_length": 4096
+      }
+    ]
+  }
+}

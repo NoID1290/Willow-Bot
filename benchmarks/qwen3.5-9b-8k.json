@@ -1,0 +1,112 @@
+{
+  "model": "qwen3.5:9b-q4_K_M",
+  "context": 8192,
+  "output_tokens": 384,
+  "passed": 4,
+  "total": 5,
+  "cases": [
+    {
+      "case": "start_without_supplies",
+      "passed": true,
+      "seconds": 3.92,
+      "decision": {
+        "action": "mine",
+        "target": "minecraft:oak_log",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "Gather wood and establish a safe survival base.",
+        "say": "",
+        "memory": "",
+        "id": "a623b614-a924-4d6a-878b-ac10c5938977"
+      }
+    },
+    {
+      "case": "craft_first_table",
+      "passed": true,
+      "seconds": 0.92,
+      "decision": {
+        "action": "craft",
+        "target": "minecraft:crafting_table",
+        "x": 0,
+        "y": 65,
+        "z": 0,
+        "goal": "Gather wood and establish a safe survival base.",
+        "say": "Crafting table made!",
+        "memory": "",
+        "id": "97bff44a-78b7-4242-8da4-3d5a2f5f8417"
+      }
+    },
+    {
+      "case": "craft_pickaxe",
+      "passed": true,
+      "seconds": 1.03,
+      "decision": {
+        "action": "craft",
+        "target": "minecraft:wooden_pickaxe",
+        "x": 0,
+        "y": 65,
+        "z": 0,
+        "goal": "Gather wood and establish a safe survival base.",
+        "say": "Making a pickaxe.",
+        "memory": "Crafted wooden pickaxe to mine stone.",
+        "id": "d922b80a-8588-4003-a9ea-b52f721fd743"
+      }
+    },
+    {
+      "case": "eat_when_hungry",
+      "passed": false,
+      "seconds": 0.83,
+      "decision": {
+        "action": "mine",
+        "target": "minecraft:oak_log",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "Gather wood and establish a safe survival base.",
+        "say": "",
+        "memory": "",
+        "id": "4fe68b42-54bd-4c21-9489-59a116669d6a"
+      }
+    },
+    {
+      "case": "reply_to_player",
+      "passed": true,
+      "seconds": 1.0,
+      "decision": {
+        "action": "mine",
+        "target": "minecraft:oak_log",
+        "x": 3,
+        "y": 65,
+        "z": 1,
+        "goal": "gather wood",
+        "say": "Hi! I'm gathering some oak logs to build a shelter.",
+        "memory": "Need wood for crafting table and tools.",
+        "id": "dc096bdb-3b7e-4be3-ad48-63f5b565a53f"
+      }
+    }
+  ],
+  "ollama_residency": {
+    "models": [
+      {
+        "name": "qwen3.5:9b-q4_K_M",
+        "model": "qwen3.5:9b-q4_K_M",
+        "size": 5729167604,
+        "digest": "6488c96fa5faab64bb65cbd30d4289e20e6130ef535a93ef9a49f42eda893ea7",
+        "details": {
+          "parent_model": "",
+          "format": "gguf",
+          "family": "qwen35",
+          "families": [
+            "qwen35"
+          ],
+          "parameter_size": "9.7B",
+          "quantization_level": "Q4_K_M"
+        },
+        "expires_at": "2026-10-01T17:45:02.146089617-04:00",
+        "size_vram": 5729167604,
+        "context_length": 8192
+      }
+    ]
+  }
+}

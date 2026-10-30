@@ -1,0 +1,11 @@
+{
+  "required": true,
+  "package": "local.minecraft.ai.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "mixins": [
+    "ServerLevelSoundMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

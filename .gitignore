@@ -1,0 +1,8 @@
+.gradle/
+build/
+run/
+tools/
+libs/
+__pycache__/
+*.sqlite3*
+*.log

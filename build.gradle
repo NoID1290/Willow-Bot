@@ -1,0 +1,69 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version '1.17.21'
+}
+
+version = '0.1.0'
+group = 'local.minecraft.ai'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    minecraft 'com.mojang:minecraft:26.3'
+    implementation 'net.fabricmc:fabric-loader:0.19.5'
+    implementation 'net.fabricmc.fabric-api:fabric-api:0.161.0+26.3'
+    implementation files('libs/fabric-carpet-26.3+v260915.jar')
+}
+
+loom {
+    runs {
+        gametest {
+            server()
+            name 'Local AI headless integration tests'
+            vmArg '-Dfabric-api.gametest'
+            vmArg '-Dlocalai.testing=true'
+            runDir 'build/gametest'
+        }
+        liveBrain {
+            server()
+            name 'Live Ollama survival integration'
+            vmArg '-Dfabric-api.gametest'
+            vmArg '-Dlocalai.testing=true'
+            vmArg '-Dlocalai.liveTest=true'
+            runDir 'build/live-gametest'
+        }
+        clientSmoke {
+            client()
+            name 'Local AI model picker smoke test'
+            vmArg '-Dlocalai.clientSmoke=true'
+            runDir 'build/client-smoke'
+        }
+        clientCameraSmoke {
+            client()
+            name 'Local AI in-world cinematic camera test'
+            vmArg '-Dlocalai.clientCameraSmoke=true'
+            runDir 'build/client-camera-smoke'
+        }
+    }
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 25
+}
+
+processResources {
+    from('brain') {
+        include 'server.py', 'skills.py', 'experience.py', 'modelprofile.py', 'monitor.py', 'memory.py', 'multimodal.py'
+        into 'localai/brain'
+    }
+    inputs.property 'version', project.version
+    filesMatching('fabric.mod.json') {
+        expand version: project.version
+    }
+}

@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "localai",
+  "version": "${version}",
+  "name": "Local AI Player",
+  "description": "An autonomous survival player with a local Ollama brain and persistent memories.",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["local.minecraft.ai.LocalAiMod"],
+    "client": ["local.minecraft.ai.client.WillowClient"],
+    "fabric-gametest": ["local.minecraft.ai.LocalAiGameTests"]
+  },
+  "mixins": [
+    "localai.mixins.json",
+    "localai.client.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "26.3",
+    "java": ">=25",
+    "fabric-api": "*",
+    "carpet": "*"
+  }
+}

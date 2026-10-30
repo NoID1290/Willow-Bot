@@ -1,0 +1,9 @@
+{
+  "required": true,
+  "package": "local.minecraft.ai.client.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": ["CameraMixin"],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
