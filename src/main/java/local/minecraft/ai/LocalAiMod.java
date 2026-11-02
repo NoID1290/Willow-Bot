@@ -381,7 +381,7 @@ public final class LocalAiMod implements ModInitializer {
         bridge = newBridge(model);
         int[] runner = savedProfileRunnerOptions(model);
         OllamaService.get().preload(model, runner[0], runner[1]);
-        SightPerception.configureForModel(model);
+        SightPerception.setSnapshotEnabled(true);
         player = spawn(server);
         AcousticSensor.setPlayer(player);
         actions = new Actions(player);
@@ -639,6 +639,9 @@ public final class LocalAiMod implements ModInitializer {
                                 decision.get("say").getAsString());
                     }
                     chat.subList(0, Math.min(sentChat, chat.size())).clear();
+                    if (decision.has("vision") && decision.get("vision").isJsonPrimitive()) {
+                        SightPerception.setSnapshotEnabled(decision.get("vision").getAsBoolean());
+                    }
                     actions.start(decision);
                     String speech = decision.get("say").getAsString();
                     if (!speech.isBlank()) {

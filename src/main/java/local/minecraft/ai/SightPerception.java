@@ -40,17 +40,14 @@ public final class SightPerception {
 
     private static volatile String lastLookingAt = "Air";
     private static volatile String lastVisible = "Clear FOV";
-    private static volatile boolean snapshotEnabled;
+    private static volatile boolean snapshotEnabled = true;
 
     public static String currentLookingAt() { return lastLookingAt; }
     public static String currentVisibleSummary() { return lastVisible; }
 
-    /** Text-only models discard the image, so skip the 256 raycasts + PNG encode per decision for them. */
-    public static void configureForModel(String model) {
-        String lower = model == null ? "" : model.toLowerCase(java.util.Locale.ROOT);
-        snapshotEnabled = lower.contains("vl") || lower.contains("vision") || lower.contains("omni")
-                || lower.contains("strata") || lower.contains("llava") || lower.contains("gemma")
-                || lower.contains("minicpm-v") || lower.contains("moondream") || OllamaService.isLfmFamily(model);
+    /** The brain reports per decision whether it sends images; text-only profiles skip the 256-raycast PNG. */
+    public static void setSnapshotEnabled(boolean enabled) {
+        snapshotEnabled = enabled;
     }
 
     public JsonObject observe(ServerPlayer player) {

@@ -400,17 +400,35 @@ by Ollama). `benchmarks/qwen3.5-9b-8k.json` records the new configuration.
 ### Local-LLM efficiency
 
 - **KV-cache prefix reuse.** Ollama skips prompt tokens that match the previous
-  request's prefix. The system prompt is static, and the observation JSON is now
-  ordered from slow-changing (goal, strategy, notes, knowledge, waypoints,
-  inventory, recipes) to per-tick data (position, blocks, entities, sensors,
-  last result, chat). `brain.log` reports `cached=` per request.
+  request's prefix, but measured on this machine it only does so once the shared
+  prefix exceeds about 1,024 tokens (Qwen3.5's hybrid architecture additionally
+  resumes from ~1k-token checkpoints). The system prompt therefore carries all
+  constant guidance, and the observation JSON is ordered from slow-changing
+  (strategy, notes, inventory, milestones, recipes, lookup) to per-decision data
+  (goal text, distances, histories, position, blocks, entities, sensors, last
+  result, chat). `brain.log` reports `cached=` per request; expect 0 until the
+  stable part is long enough, which is normal.
+- **Thinking per role.** With `think: auto` the actor answers without
+  chain-of-thought (measured 0.8-2.6 s instead of 24-68 s per decision on an
+  RTX 4070 Ti), while the background strategist keeps thinking with a 2,048+
+  token budget. Set `think: on` (or `roles.actor.think: on`) in the settings
+  screen to make the actor think too. The startup line shows
+  `think=actor:.../strategist:...`.
+- **Vision auto-enable.** Image input is used when the model reports the
+  `vision` capability and at least 512 MiB of KV budget remains after
+  Minecraft, weights and the safety margin. VRAM is sampled *before* the model
+  loads (together with `/api/ps`), so a model that is still loading can no
+  longer be mistaken for Minecraft's share; previously that mistake halved the
+  context to 8K and disabled vision. The brain reports `vision` on every
+  decision, and the mod renders the 64x64 PNG snapshot only when it is true.
 - **No duplicated sensors.** Sight/hearing are sent once (`seeing`/`listening`),
-  and the 64x64 PNG snapshot is only rendered and transmitted for vision-capable
-  models.
-- **Single model load.** The mod preloads the model only with the exact
-  `num_ctx`/`num_thread` saved in `<world>/localai/model-profile.json`;
-  otherwise the brain's startup benchmark performs the one warm load. Loading
-  with a different context would make Ollama restart the runner.
+  and the 64x64 PNG snapshot is only rendered and transmitted for profiles with
+  vision enabled.
+- **Single model load.** The brain warm-loads the model once with its final
+  `num_ctx`/`num_thread` before benchmarking (so the benchmark measures warm
+  speed rather than timing out on a cold load), and the mod preloads only with
+  the exact options saved in `<world>/localai/model-profile.json`. Loading with
+  a different context would make Ollama restart the runner.
 - **No deterministic repeat loops.** When a plan is rejected (HTTP 422), the next
   request carries the rejection reason as a `correction` and raises sampling
   temperature by 0.3 (0.6 on the in-request corrective retry), so a low-temperature

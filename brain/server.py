@@ -94,9 +94,9 @@ Always chain 2-6 steps when gathering or crafting (e.g. mine log -> pickup log -
 SURVIVAL RULES:
 1. Priority: survive, food (if food < 14 and holding food, eat now), logs, planks, crafting_table, sticks, wooden_pickaxe, cobblestone, stone tools, furnace/smelt iron/food, shelter, sleep at night, exploration. Pursue saved_goal; update goal when complete or blocked.
 2. Trees in sight: when logs appear in nearby_blocks or seeing.looking_at, mine them directly (with exact x/y/z or 0,0,0). NEVER repeat goto or circle when a tree is visible and wood is needed.
-3. No duplicates: milestones.owned_tools and inventory show completed tools/tables. NEVER craft duplicate pickaxes, axes, swords, shovels, hoes, furnaces or crafting_tables already owned, or unrequested redstone/decorative items (levers, buttons, slabs, stairs, walls). Follow crafting.next_step to bootstrap tools; place an inventory crafting_table at crafting.placement_sites for 3x3 recipes.
-4. Caves, pits, tunnels & bridges: blocked_actions failed twice here—change target, move to terrain.exits, or alter conditions. If stuck in a cave/hole/pit, use pillar, tunnel (dig 1x2 path forward), bridge (place horizontal path across gaps/water), or escape.
-5. Stockpile & full inventory: stop mining bulk stone/dirt once milestones.enough_building_blocks is reached (64-128 cobble) or milestones.inventory_free_slots == 0. Use chest to store excess items or retrieve supplies. Collect needed item drops with pickup only when entities contains item drops.
+3. No duplicates: milestones.owned_tools and inventory show completed tools/tables; owned tools are finished milestones, not missing prerequisites. NEVER craft duplicate pickaxes, axes, swords, shovels, hoes, furnaces or crafting_tables already owned, or unrequested redstone/decorative items (levers, buttons, slabs, stairs, walls). Follow crafting.next_step to bootstrap tools; place an inventory crafting_table at crafting.placement_sites for 3x3 recipes. Basics: 1 log -> 4 planks; a crafting_table is 4 planks in the 2x2 grid (no table needed for planks, sticks or the table itself); a wooden_pickaxe is 3 planks + 2 sticks and needs a placed table.
+4. Caves, pits, tunnels & bridges: blocked_actions failed twice here—change target, move to terrain.exits, or alter conditions. If stuck in a cave/hole/pit, use pillar (places a block under your feet to get higher), tunnel (dig 1x2 path forward), bridge (place horizontal path across gaps/water), or escape (may take fall damage or break the block supporting you).
+5. Stockpile & full inventory: stop mining bulk stone/dirt once milestones.enough_building_blocks lists it (those items are ENOUGH; never gather more) or milestones.inventory_free_slots == 0. Use chest to store excess items or retrieve supplies. Collect needed item drops with pickup only when entities contains item drops.
 6. Action semantics: mine (block ID + observed x/y/z or 0,0,0; logs by hand, stone needs pickaxe); craft (exact ID from craftable); smelt (item ID from smeltable); chest (item ID or ""); sleep (use/place bed at night); trade (villager trade item or ""); boat (use/place boat on water); shelter (build protective walls/roof); portal (light/enter portal); place (ID from placeable at exact crafting.placement_sites x/y/z); goto (walk to x/y/z or head toward far global waypoints); run/sprint (fast move, needs food > 6); attack (numeric non-player entity ID).
 7. Chat & permanent memory: if chat is nonempty, ALWAYS reply briefly in say and adopt reasonable requests; otherwise state brief sensory/action observations in say. Save new durable facts in memory (shown in my_notes) and named locations (home, base, table, cave, iron) in waypoint. Return JSON only."""
 
@@ -1564,10 +1564,6 @@ class Brain:
             "can_pillar_up": can_pillar,
             "inventory_free_slots": free_slots(observation),
             "enough_building_blocks": enough_blocks,
-            "reminder": "Owned tools are completed milestones, not missing prerequisites. "
-                        "Never craft duplicate tools already in owned_tools or inventory. "
-                        "Items in enough_building_blocks are ENOUGH: never gather more of them. "
-                        "To get higher or climb out of pits/caves, use pillar to place a block under yourself.",
         }
         if (pickaxes_total > 0 and counts.get("minecraft:stone_pickaxe", 0) == 0
                 and counts.get("minecraft:iron_pickaxe", 0) == 0 and counts.get("minecraft:cobblestone", 0) < 3):
@@ -1588,15 +1584,23 @@ class Brain:
         lessons = [r[0] for r in self.db.execute(
             "SELECT text FROM lessons ORDER BY used DESC LIMIT ?", (lesson_limit,)
         )]
-        # Key order matters for local inference: Ollama reuses the KV cache for the longest unchanged
-        # prefix, so slow-changing memory/goal data comes first and per-tick sensor data comes last.
-        stable_keys = ("lookup", "blocked_actions", "milestones")
-        slow_keys = ("dimension", "biome", "inventory", "placeable", "inventory_change", "craftable", "smeltable",
-                     "trades", "crafting")
-        volatile_keys = ("position", "health", "food", "air", "on_ground", "in_water", "time", "weather", "terrain",
-                         "diagnosis", "nearby_blocks", "visible_tree", "entities", "seeing", "listening", "doing",
-                         "sight", "hearing", "lfm_omni_synthesis", "active_tools", "last_result", "chat")
-        observed = {k: copy.deepcopy(observation[k]) for k in stable_keys + slow_keys + volatile_keys if k in observation}
+        # Key order matters for local inference: Ollama reuses the KV cache only for the longest unchanged
+        # prefix (and only once that prefix exceeds roughly 1k tokens), so slow-changing memory/inventory
+        # data comes first and anything that changes every decision comes last.
+        stable_keys = ("inventory", "placeable", "milestones", "craftable", "smeltable", "trades",
+                       "lookup", "blocked_actions", "inventory_change", "dimension", "biome")
+        volatile_keys = ("crafting", "position", "health", "food", "air", "on_ground", "in_water", "time",
+                         "weather", "terrain", "diagnosis", "nearby_blocks", "visible_tree", "entities", "seeing",
+                         "listening", "doing", "sight", "hearing", "lfm_omni_synthesis", "active_tools",
+                         "last_result", "chat")
+        observed = {k: copy.deepcopy(observation[k]) for k in stable_keys + volatile_keys if k in observation}
+        # Constant guidance lives in the system prompt; resending it per decision only costs tokens.
+        if isinstance(observed.get("crafting"), dict):
+            observed["crafting"].pop("knowledge", None)
+        if isinstance(observed.get("diagnosis"), dict):
+            observed["diagnosis"].pop("risk_policy", None)
+        if isinstance(observed.get("milestones"), dict):
+            observed["milestones"].pop("reminder", None)
         # The pipeline mirrors sight->seeing and hearing->listening; sending both wastes prompt tokens.
         if "seeing" in observed:
             observed.pop("sight", None)
@@ -1613,15 +1617,19 @@ class Brain:
         else:
             recent_actions = self.recent_actions(recent_limit)
 
-        context = {"saved_goal": goal[0] if goal else "Gather wood and establish a safe survival base."}
+        memory_context = self.memory.context(observation)
+        context = {}
         if strategy:
             context["strategy"] = json.loads(strategy[0])
-        context["strategist_status"] = self.planner_status
-        context.update(self.memory.context(observation))
-        context["observed_lessons"] = lessons
-        for key in stable_keys + slow_keys:
+        context["my_notes"] = memory_context.pop("my_notes", [])
+        for key in stable_keys:
             if key in observed:
                 context[key] = observed[key]
+        # Per-decision data from here on: the model's own goal text, status, distances and histories.
+        context["saved_goal"] = goal[0] if goal else "Gather wood and establish a safe survival base."
+        context["strategist_status"] = self.planner_status
+        context.update(memory_context)
+        context["observed_lessons"] = lessons
         context["recent_actions"] = recent_actions
         for key in volatile_keys:
             if key in observed:
@@ -2092,6 +2100,8 @@ class Brain:
                 LOG.warning("Could not export memory.json: %s", exc)
         decision["id"] = decision_id
         decision["watch"] = self.memory.watch_list(observation)
+        # Tells the mod whether rendering the PNG snapshot is worthwhile for this model/profile.
+        decision["vision"] = bool((self.profile or {}).get("vision_enabled"))
         self.steps_last_id = decision_id
         LOG.info("decision=%s action=%s target=%s source=%s elapsed=%.2fs",
                  decision_id, decision["action"], decision["target"],

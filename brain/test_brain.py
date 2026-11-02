@@ -713,9 +713,10 @@ class BrainTests(unittest.TestCase):
         self.assertNotIn("hearing", ctx)
         self.assertNotIn("snapshot_png_base64", json.dumps(ctx))
         keys = list(ctx)
-        self.assertLess(keys.index("saved_goal"), keys.index("inventory"))
-        self.assertLess(keys.index("inventory"), keys.index("position"))
+        self.assertLess(keys.index("inventory"), keys.index("saved_goal"), "stable sections precede per-decision ones")
+        self.assertLess(keys.index("saved_goal"), keys.index("position"))
         self.assertEqual(keys[-1], "active_tools")
+        self.assertNotIn("reminder", ctx["milestones"])
 
 
 if __name__ == "__main__":

@@ -208,14 +208,18 @@ class ModelProfileTests(unittest.TestCase):
         self.assertEqual(profile["options"]["temperature"], 0.2)
         self.assertEqual(profile["options"]["num_thread"], 6)
         self.assertEqual(profile["actor_tokens"], 448)
-        self.assertEqual(profile["plan_tokens"], 832)
+        # The strategist keeps chain-of-thought on a thinking model, so its budget must hold a reasoning trace.
+        self.assertEqual(profile["plan_tokens"], 2048)
+        self.assertIs(profile["roles"]["actor"]["think"], False)
+        self.assertIs(profile["roles"]["strategist"]["think"], True)
+        self.assertEqual(profile["roles"]["strategist"]["num_predict"], 2048)
         self.assertEqual(
             profile["prompt_tokens"],
             profile["context"] - profile["json_output_tokens"] - profile["thinking_reserve_tokens"] - profile["safety_margin_tokens"],
         )
         self.assertEqual(profile["prompt_bytes"], int(profile["prompt_tokens"] * 4.08))
         self.assertEqual(profile["timeouts"]["actor_timeout"], 60)
-        self.assertEqual(profile["timeouts"]["plan_timeout"], 84)
+        self.assertEqual(profile["timeouts"]["plan_timeout"], 90)
         self.assertEqual(profile["sources"]["gameplay_limits"], "hardware_and_latency_derived")
         self.assertGreaterEqual(profile["gameplay_limits"]["lessons_cap"], 2000)
         self.assertGreaterEqual(profile["gameplay_limits"]["decisions_cap"], 20000)
@@ -229,13 +233,19 @@ class ModelProfileTests(unittest.TestCase):
         self.assertEqual(profile["planner_mode"], "idle_only")
         self.assertTrue(profile["vision_enabled"])
 
-        # Regression test: when live benchmark loads model into VRAM (vram_used_mib=6768)
-        # but /api/ps only reports KV cache (ps_vram_mib=268), model weights (4375 MiB) are not double-counted
-        lfm_hw = dict(hw, vram_used_mib=6768, model_weights_mib=4375, ps_vram_mib=268)
-        lfm_bench = dict(bench, model_weights_mib=4375, ps_vram_mib=268)
+        # Regression test: VRAM is sampled before the benchmark together with /api/ps. A model still
+        # resident from the previous session (ps_vram_mib) must not be counted as Minecraft's share, and a
+        # benchmark that timed out mid-load must not inflate it either (bench ps is ignored when hw has one).
+        lfm_hw = dict(hw, vram_used_mib=6768, model_weights_mib=4375, ps_vram_mib=4643)
+        lfm_bench = dict(bench, model_weights_mib=4375, ps_vram_mib=0, source="fallback(timed out)")
         lfm_prof = modelprofile.build("lfm3-all:latest", GEMMA4, hardware=lfm_hw, benchmark=lfm_bench)
+        self.assertEqual(lfm_prof["minecraft_reserve_mib"], 3200)
         self.assertEqual(lfm_prof["planner_mode"], "idle_only")
         self.assertTrue(lfm_prof["vision_enabled"])
+        # Without a ps sample the whole pre-load usage is non-model usage (Minecraft + shaders).
+        heavy = modelprofile.build("lfm3-all:latest", GEMMA4, hardware=dict(hw, vram_used_mib=4100, ps_vram_mib=0),
+                                   benchmark=bench)
+        self.assertEqual(heavy["minecraft_reserve_mib"], 4100)
 
     def test_role_profile_derivation_and_budget_consistency(self):
         # Verify role-aware configuration and consistency between tokens, bytes, and num_ctx

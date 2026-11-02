@@ -633,12 +633,10 @@ def build(model, show, settings=None, hardware=None, benchmark=None):
     vram_total_mib = int(hw.get("vram_total_mib") or 12282)
     vram_used_mib = int(hw.get("vram_used_mib") or 1315)
     weights_mib = int(hw.get("model_weights_mib") or bench.get("model_weights_mib") or estimate_weights_mib(model, show))
-    ps_vram_mib = int(hw.get("ps_vram_mib") or bench.get("ps_vram_mib") or 0)
-    # Subtract any currently loaded model VRAM from vram_used_mib so we don't double-count the model against itself.
-    # When live benchmark has just run (or /api/ps reports a loaded model), the model weights are already in vram_used_mib.
-    benchmark_loaded_model = bench.get("source") == "ollama_live_benchmark" or ps_vram_mib > 0
-    resident_model_vram = max(ps_vram_mib, weights_mib) if benchmark_loaded_model else 0
-    non_model_vram_used = max(0, vram_used_mib - resident_model_vram) if resident_model_vram else vram_used_mib
+    ps_vram_mib = int(hw["ps_vram_mib"] or 0) if "ps_vram_mib" in hw else int(bench.get("ps_vram_mib") or 0)
+    # vram_used_mib and ps_vram_mib are sampled together before any load (see autotune), so the
+    # non-model share is simply their difference. A load that is still in progress cannot inflate it.
+    non_model_vram_used = max(0, vram_used_mib - ps_vram_mib)
     minecraft_reserve_mib = max(int(preset.get("minecraft_reserve_mib", 3200)), non_model_vram_used)
     safety_margin_mib = int(preset.get("safety_margin_mib", 1024))
     if is_strata:
@@ -718,19 +716,42 @@ def build(model, show, settings=None, hardware=None, benchmark=None):
         if thinking and arch.startswith("gptoss"):
             think_value = "medium"
 
+    # Per-role thinking is decided here so that each role's output budget matches its mode.
+    role_overrides = settings.get("roles") or {}
+    actor_override = role_overrides.get("actor") or {}
+    strat_override = role_overrides.get("strategist") or {}
+    if "think" in actor_override:
+        actor_thinking = thinking_supported and actor_override["think"] in ("on", True)
+    elif "think" in settings and settings["think"] != "auto":
+        actor_thinking = thinking_supported and settings["think"] == "on"
+    elif hw_mode:
+        actor_thinking = False
+    else:
+        actor_thinking = thinking
+    if "think" in strat_override:
+        strat_thinking = thinking_supported and strat_override["think"] not in ("off", False)
+    elif "think" in settings and settings["think"] != "auto":
+        strat_thinking = thinking_supported and settings["think"] == "on"
+    else:
+        strat_thinking = thinking_supported
+
     if hw_mode:
         target_actor_s = float(preset.get("target_actor_latency_s", 2.5))
         target_plan_s = float(preset.get("target_plan_latency_s", 15.0))
         # Actor JSON schema responses are 60-140 tokens (~260-520 bytes).
         # Size actor_tokens to gen_tps * target_actor_s * 3.5x safety margin so done_reason=="length" never happens.
-        if thinking:
+        if actor_thinking:
             auto_actor = _round_tokens(measured_gen_tps * max(target_actor_s * 8.0, 20.0), low=1536, high=min(4096, context // 2))
-            auto_plan = _round_tokens(measured_gen_tps * max(target_plan_s * 2.0, 30.0), low=2048, high=min(4096, context // 2))
         else:
             auto_actor = _round_tokens(measured_gen_tps * target_actor_s * 3.5, low=384, high=min(1024, context // 4))
+        if strat_thinking:
+            # Reasoning traces for skill code routinely exceed 1500 tokens; a smaller cap just forces the
+            # think=False fallback on every call.
+            auto_plan = _round_tokens(measured_gen_tps * max(target_plan_s * 2.0, 30.0), low=2048, high=min(4096, context // 2))
+        else:
             auto_plan = _round_tokens(measured_gen_tps * target_plan_s * 1.2, low=768, high=min(2048, context // 4))
-        sources["actor_tokens"] = f"latency_formula(gen_tps={measured_gen_tps:.1f} * target={target_actor_s}s * safety=3.5)"
-        sources["plan_tokens"] = f"latency_formula(gen_tps={measured_gen_tps:.1f} * target={target_plan_s}s * safety=1.2)"
+        sources["actor_tokens"] = f"latency_formula(gen_tps={measured_gen_tps:.1f} * target={target_actor_s}s, think={actor_thinking})"
+        sources["plan_tokens"] = f"latency_formula(gen_tps={measured_gen_tps:.1f} * target={target_plan_s}s, think={strat_thinking})"
     elif is_lfm:
         auto_actor = min(1024, max(512, context // 16))
         auto_plan = min(2048, max(1024, context // 8))
@@ -756,9 +777,10 @@ def build(model, show, settings=None, hardware=None, benchmark=None):
 
     # Decompose output reserve into pure JSON output tokens + thinking reserve + safety margin:
     # prompt_tokens = context - output_tokens - thinking_reserve - safety_margin
+    any_thinking = thinking or actor_thinking or strat_thinking
     total_output_reserve = max(actor_tokens, plan_tokens)
-    json_output_tokens = min(1024, total_output_reserve) if thinking else total_output_reserve
-    thinking_reserve_tokens = max(0, total_output_reserve - json_output_tokens) if thinking else 0
+    json_output_tokens = min(1024, total_output_reserve) if any_thinking else total_output_reserve
+    thinking_reserve_tokens = max(0, total_output_reserve - json_output_tokens) if any_thinking else 0
     safety_margin_tokens = TEMPLATE_TOKENS if not hw_mode else max(TEMPLATE_TOKENS, min(1024, context // 32))
     prompt_tokens = context - json_output_tokens - thinking_reserve_tokens - safety_margin_tokens
     prompt_bytes = int(min(PROMPT_BYTES_CAP, prompt_tokens * measured_bpt))
@@ -851,47 +873,12 @@ def build(model, show, settings=None, hardware=None, benchmark=None):
         planner_mode = "disabled"
     sources["planner_mode"] = f"single_gpu_policy({planner_mode}, num_parallel=1)"
 
-    # Configure Role-Aware parameters (actor vs strategist)
-    role_overrides = settings.get("roles") or {}
-    actor_override = role_overrides.get("actor") or {}
-    strat_override = role_overrides.get("strategist") or {}
-
-    # Actor: thinking OFF by default in hardware/auto mode, or follow settings/override
-    if "think" in actor_override:
-        actor_think_val = actor_override["think"]
-        if actor_think_val in ("on", True):
-            actor_thinking = thinking_supported
-        elif actor_think_val in ("off", False):
-            actor_thinking = False
-        else:
-            actor_thinking = False
-    elif "think" in settings and settings["think"] != "auto":
-        actor_thinking = thinking_supported and settings["think"] == "on"
-    elif hw_mode:
-        actor_thinking = False
-    else:
-        actor_thinking = thinking
-
+    # Configure Role-Aware parameters (actor vs strategist); thinking per role was decided above.
     actor_think_value = None
     if thinking_supported:
         actor_think_value = actor_thinking
         if actor_thinking and arch.startswith("gptoss"):
             actor_think_value = "medium"
-
-    # Strategist: thinking ON if supported (unless user explicitly sets think off), output cap 2048-4096
-    if "think" in strat_override:
-        strat_think_val = strat_override["think"]
-        if strat_think_val in ("on", True):
-            strat_thinking = thinking_supported
-        elif strat_think_val in ("off", False):
-            strat_thinking = False
-        else:
-            strat_thinking = thinking_supported
-    elif "think" in settings and settings["think"] != "auto":
-        strat_thinking = thinking_supported and settings["think"] == "on"
-    else:
-        # Default: Strategist thinking is ON if supported
-        strat_thinking = thinking_supported
 
     strat_think_value = None
     if thinking_supported:
@@ -1002,6 +989,24 @@ def build(model, show, settings=None, hardware=None, benchmark=None):
         "options": options,
         "settings": settings,
     }
+
+
+def warm_load(model, ollama="http://127.0.0.1:11434", context=16384, num_thread=6, timeout=120):
+    """Load the model with the runner options the brain will use, so the benchmark measures warm speed
+    and the first decision does not pay for a second load. Returns the load time in seconds or None."""
+    if "strata" in (model or "").lower():
+        return None
+    body = {"model": model, "messages": [], "keep_alive": "15m",
+            "options": {"num_ctx": context, "num_thread": num_thread}}
+    started = time.monotonic()
+    try:
+        req = urllib.request.Request(ollama + "/api/chat", data=json.dumps(body).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read(65536)
+        return round(time.monotonic() - started, 2)
+    except Exception:
+        return None
 
 
 def benchmark_model(model, ollama="http://127.0.0.1:11434", show=None, context=16384, num_thread=6, timeout=30):
@@ -1134,20 +1139,21 @@ def autotune(model, ollama="http://127.0.0.1:11434", settings=None, show=None, r
     hw["weights_source"] = weight_src
     prelim = build(model, show, settings=settings, hardware=hw)
     if run_benchmark:
+        load_s = warm_load(model, ollama=ollama, context=prelim["context"],
+                           num_thread=prelim["options"]["num_thread"], timeout=120)
         bench = benchmark_model(
             model,
             ollama=ollama,
             show=show,
             context=prelim["context"],
             num_thread=prelim["options"]["num_thread"],
-            timeout=25,
+            timeout=40,
         )
-        # Re-query GPU VRAM after model is warm in VRAM so vram_used_mib is up to date
+        bench["load_s"] = load_s
+        # The VRAM sample taken before loading stays authoritative for the Minecraft share; only the
+        # free-memory figure is refreshed for display.
         hw_after = detect_hardware()
-        hw["vram_used_mib"] = hw_after["vram_used_mib"]
-        hw["vram_free_mib"] = hw_after["vram_free_mib"]
-        if bench.get("ps_vram_mib"):
-            hw["ps_vram_mib"] = bench["ps_vram_mib"]
+        hw["vram_free_after_load_mib"] = hw_after["vram_free_mib"]
     else:
         bench = {
             "model_weights_mib": weights_mib,
@@ -1174,6 +1180,9 @@ def format_startup_log(profile):
     limits = profile.get("gameplay_limits") or {}
     sources = profile.get("sources") or {}
     opts = profile.get("options") or {}
+    roles = profile.get("roles") or {}
+    actor_role = roles.get("actor") or {}
+    strat_role = roles.get("strategist") or {}
     return (
         f"[AUTOTUNE] preset={profile.get('preset')} "
         f"gpu={hw.get('gpu_name', 'unknown')}({profile.get('vram_total_mib')}MiB total, "
@@ -1183,14 +1192,15 @@ def format_startup_log(profile):
         f"cpu={hw.get('cpu_model', 'unknown')}({hw.get('cpu_cores', 8)}C/{hw.get('cpu_threads', 16)}T -> "
         f"num_thread={opts.get('num_thread')}, src={sources.get('num_thread', 'default')}) "
         f"model={profile.get('model')} ctx={profile.get('context')}(trained={profile.get('trained_context')}, src={sources.get('context')}) "
-        f"think={profile.get('think_value')}(src={sources.get('think')}) "
+        f"think=actor:{actor_role.get('think_value', profile.get('think_value'))}/"
+        f"strategist:{strat_role.get('think_value', profile.get('think_value'))}(src={sources.get('think')}) "
         f"temp={opts.get('temperature', 'model_default')}(src={sources.get('temperature')}) "
-        f"actor_tok={profile.get('actor_tokens')}(src={sources.get('actor_tokens')}) "
-        f"plan_tok={profile.get('plan_tokens')}(src={sources.get('plan_tokens')}) "
+        f"actor_tok={actor_role.get('num_predict', profile.get('actor_tokens'))}(src={sources.get('actor_tokens')}) "
+        f"plan_tok={strat_role.get('num_predict', profile.get('plan_tokens'))}(src={sources.get('plan_tokens')}) "
         f"prompt_budget={profile.get('prompt_tokens')}tok/{profile.get('prompt_bytes')}B@"
         f"{profile.get('bytes_per_token')}B/tok(trim_scale={profile.get('trim_scale')}, "
         f"compact_below={profile.get('compact_prompt_threshold_tokens')}tok, src={sources.get('prompt_budget')}) "
-        f"speed=(prompt_tps={profile.get('prompt_tps')}, gen_tps={profile.get('gen_tps')}, src={bench.get('source', sources.get('throughput'))}) "
+        f"speed=(prompt_tps={profile.get('prompt_tps')}, gen_tps={profile.get('gen_tps')}, load={bench.get('load_s')}s, src={bench.get('source', sources.get('throughput'))}) "
         f"timeouts=(actor={timeouts.get('actor_timeout')}s, plan={timeouts.get('plan_timeout')}s, "
         f"plan_max_age={timeouts.get('plan_max_age')}s, steps_deadline={timeouts.get('steps_deadline')}s, "
         f"next_plan={timeouts.get('next_plan_interval')}s, skill_hold={timeouts.get('skill_hold_seconds')}s, "

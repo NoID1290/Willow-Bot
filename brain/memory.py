@@ -262,8 +262,8 @@ class Memory:
         """, (dimension, here[0], here[0], here[1], here[1], here[2], here[2])).fetchall()
         totals = dict(self.db.execute("SELECT block,COUNT(*) FROM placed_blocks WHERE state='present' "
                                       "GROUP BY block ORDER BY COUNT(*) DESC LIMIT 12").fetchall())
-        waypoints = sorted(self.db.execute("SELECT name,dimension,x,y,z,note FROM waypoints").fetchall(),
-                           key=lambda r: (r[1] != dimension, distance(r[2:5])))[:16]
+        waypoints = sorted(self.db.execute("SELECT name,dimension,x,y,z,note FROM waypoints WHERE name!='last_position'")
+                           .fetchall(), key=lambda r: (r[1] != dimension, distance(r[2:5])))[:16]
         visible = {b.get("id") for b in observation.get("nearby_blocks", []) if isinstance(b, dict)}
         remembered = []
         for kind, x, y, z in self.db.execute("""
