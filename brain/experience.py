@@ -49,7 +49,11 @@ class Experience:
         old, new = json.loads(before[1]), inventory(observation)
         delta = {item: new.get(item, 0) - old.get(item, 0) for item in old.keys() | new.keys()
                  if new.get(item, 0) != old.get(item, 0)}
-        success = result.get("status") == "success"
+        status = result.get("status")
+        if status == "interrupted":
+            # Eating reflex / player chat / pause cut the action short: no evidence either way.
+            return delta
+        success = status == "success"
         now = time.time()
         self.db.execute("""
             INSERT INTO action_lookup (situation,action,target,attempts,successes,failures,

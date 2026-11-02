@@ -5,6 +5,7 @@ import carpet.patches.FakeClientConnection;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.mojang.authlib.GameProfile;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import java.io.IOException;
@@ -97,7 +98,7 @@ public final class LocalAiMod implements ModInitializer {
             if (entity == player) {
                 died = true;
                 discardPending = pending != null;
-                if (actions != null) actions.stop("Died from " + damageSource.getMsgId());
+                if (actions != null) actions.stop("Died from " + damageSource.getMsgId(), true);
             }
         });
         ServerMessageEvents.CHAT_MESSAGE.register((message, sender, params) -> {
@@ -378,7 +379,9 @@ public final class LocalAiMod implements ModInitializer {
         saveConfig();
         selectedModel = model;
         bridge = newBridge(model);
-        OllamaService.get().preload(model);
+        int[] runner = savedProfileRunnerOptions(model);
+        OllamaService.get().preload(model, runner[0], runner[1]);
+        SightPerception.configureForModel(model);
         player = spawn(server);
         AcousticSensor.setPlayer(player);
         actions = new Actions(player);
@@ -406,6 +409,24 @@ public final class LocalAiMod implements ModInitializer {
         Path temporary = file.resolveSibling("config.json.tmp");
         Files.writeString(temporary, GSON.toJson(config));
         Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    /** {num_ctx, num_thread} the brain used for this model in this world last time; zeros when unknown. */
+    private int[] savedProfileRunnerOptions(String model) {
+        Path profile = server.getWorldPath(LevelResource.ROOT).resolve("localai/model-profile.json");
+        try {
+            if (!Files.isRegularFile(profile)) return new int[]{0, 0};
+            JsonObject saved = JsonParser.parseString(Files.readString(profile)).getAsJsonObject();
+            if (!saved.has("model") || !model.equals(saved.get("model").getAsString())) return new int[]{0, 0};
+            JsonObject options = saved.has("options") ? saved.getAsJsonObject("options") : new JsonObject();
+            int numCtx = options.has("num_ctx") ? options.get("num_ctx").getAsInt()
+                    : saved.has("context") ? saved.get("context").getAsInt() : 0;
+            int numThread = options.has("num_thread") ? options.get("num_thread").getAsInt() : 0;
+            return new int[]{numCtx, numThread};
+        } catch (IOException | RuntimeException e) {
+            LOG.debug("No usable model profile for preload", e);
+            return new int[]{0, 0};
+        }
     }
 
     private int stopCommand(net.minecraft.commands.CommandSourceStack source) {
@@ -579,7 +600,7 @@ public final class LocalAiMod implements ModInitializer {
                     actions.stop(status);
                     return;
                 }
-                actions.stop("Player died");
+                actions.stop("Player died", true);
                 JsonObject deathResult = actions.result();
                 discardPending = true;
                 ServerPlayer connected = server.getPlayerList().getPlayer(PLAYER_ID);

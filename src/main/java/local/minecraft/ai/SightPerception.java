@@ -40,9 +40,18 @@ public final class SightPerception {
 
     private static volatile String lastLookingAt = "Air";
     private static volatile String lastVisible = "Clear FOV";
+    private static volatile boolean snapshotEnabled;
 
     public static String currentLookingAt() { return lastLookingAt; }
     public static String currentVisibleSummary() { return lastVisible; }
+
+    /** Text-only models discard the image, so skip the 256 raycasts + PNG encode per decision for them. */
+    public static void configureForModel(String model) {
+        String lower = model == null ? "" : model.toLowerCase(java.util.Locale.ROOT);
+        snapshotEnabled = lower.contains("vl") || lower.contains("vision") || lower.contains("omni")
+                || lower.contains("strata") || lower.contains("llava") || lower.contains("gemma")
+                || lower.contains("minicpm-v") || lower.contains("moondream") || OllamaService.isLfmFamily(model);
+    }
 
     public JsonObject observe(ServerPlayer player) {
         JsonObject sight = new JsonObject();
@@ -118,9 +127,11 @@ public final class SightPerception {
                 : seenEntities.size() + " entity/entities (" + seenEntities.get(0).entity.getType().toShortString() + ")";
 
         // 6. Base64 Visual Frame Snapshot (64x64 PNG) for multimodal LFM3-VL / Omni
-        String frameBase64 = renderVisualSnapshot(player, eyePos, yaw, pitch, seenEntities);
-        if (frameBase64 != null) {
-            sight.addProperty("snapshot_png_base64", frameBase64);
+        if (snapshotEnabled) {
+            String frameBase64 = renderVisualSnapshot(player, eyePos, yaw, pitch, seenEntities);
+            if (frameBase64 != null) {
+                sight.addProperty("snapshot_png_base64", frameBase64);
+            }
         }
 
         return sight;

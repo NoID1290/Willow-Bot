@@ -302,10 +302,15 @@ query `failures("mine", "minecraft:stone")` and `successes(...)` from its learne
 lookup table. Every returned action is checked against
 the **current**, not remembered, observation and Minecraft still applies its
 survival rules. Invalid programs are disabled and logged; three observed action
-failures disable a version. A failed action returns control to the actor before
-trying routines again. Chat bypasses routines for at least 60 seconds, and
-hunger/stuck handling takes priority. Skills may still be wrong: these are
-experiments with recorded consequences, not trusted Minecraft expertise.
+failures disable a generated version. The supplied foundation routine is never
+disabled: a mismatch only skips it for that turn. A failed action returns control
+to the actor before trying routines again. Chat bypasses routines for at least
+60 seconds, and hunger/stuck handling takes priority. Skills may still be wrong:
+these are experiments with recorded consequences, not trusted Minecraft expertise.
+When an embedding model (`qwen3-embedding`, `nomic-embed-text`, `all-minilm`) is
+installed in Ollama, the strategist's few-shot examples and skill list are ranked
+by embedding similarity (vectors are cached per text; availability is probed once
+every ten minutes); otherwise a BM25 keyword ranking is used with no extra calls.
 
 ### Longer plans and situation lookup
 
@@ -322,7 +327,13 @@ damage and net inventory changes. Situations include dimension, an eight-block
 horizontal/four-block vertical region and currently owned tool types. Two
 consecutive failures put that action/target on a two-minute cooldown in that
 situation; changing position or equipment allows a new experiment. Other
-targets remain available. At most 10,000 lookup rows are retained.
+targets remain available. Movement actions (`goto`, `run`, `sprint`) are
+recorded per destination, so a failed walk to one spot blocks only that spot,
+and a repeated `goto` to the same coordinates is rejected before it executes.
+Actions cut short by the game itself (the eating reflex, player chat, pause,
+settings restart) are reported as `interrupted` rather than `failed`: they do
+not feed cooldowns, stuck detection, skill failure counts or lessons. Deaths and
+timeouts remain real failures. At most 10,000 lookup rows are retained.
 Placement choices exclude cooldown-blocked materials and non-block inventory
 items, and constrain coordinates to currently reachable, unoccupied support sites.
 This applies to slabs and other blocks, not only crafting tables. Queued steps
@@ -385,6 +396,30 @@ slabs, considers short escape routes, and checks visibility from mining destinat
 More context improves information retention; it does not inherently speed up
 inference. At 8K, the 9B model still fits entirely on this GPU (about 5.3 GiB reported
 by Ollama). `benchmarks/qwen3.5-9b-8k.json` records the new configuration.
+
+### Local-LLM efficiency
+
+- **KV-cache prefix reuse.** Ollama skips prompt tokens that match the previous
+  request's prefix. The system prompt is static, and the observation JSON is now
+  ordered from slow-changing (goal, strategy, notes, knowledge, waypoints,
+  inventory, recipes) to per-tick data (position, blocks, entities, sensors,
+  last result, chat). `brain.log` reports `cached=` per request.
+- **No duplicated sensors.** Sight/hearing are sent once (`seeing`/`listening`),
+  and the 64x64 PNG snapshot is only rendered and transmitted for vision-capable
+  models.
+- **Single model load.** The mod preloads the model only with the exact
+  `num_ctx`/`num_thread` saved in `<world>/localai/model-profile.json`;
+  otherwise the brain's startup benchmark performs the one warm load. Loading
+  with a different context would make Ollama restart the runner.
+- **No deterministic repeat loops.** When a plan is rejected (HTTP 422), the next
+  request carries the rejection reason as a `correction` and raises sampling
+  temperature by 0.3 (0.6 on the in-request corrective retry), so a low-temperature
+  model does not reproduce the same invalid answer. If a thinking model exhausts
+  its output budget, only that role (actor or strategist) is switched to
+  non-thinking mode.
+- **Mining completion** is detected when the targeted block is gone or replaced
+  (water, falling gravel), not only when air appears, so underwater or
+  waterlogged mining no longer waits for the 120-second timeout.
 
 MoE active-parameter counts are not total memory requirements. Official Ollama
 manifests list approximately **18.62 GB** of weights for

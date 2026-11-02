@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 import re
 import textwrap
+import threading
 import time
 import urllib.request
 
@@ -90,21 +91,64 @@ def _cosine_similarity(vec_a, vec_b):
     return dot / (norm_a * norm_b)
 
 
+EMBEDDING_MODELS = ("qwen3-embedding:0.6b", "nomic-embed-text-v2-moe:latest", "nomic-embed-text", "all-minilm")
+_EMBED_PROBE_TTL = 600.0
+_EMBED_CACHE_MAX = 512
+_embed_state = {"model": None, "checked": 0.0, "cache": {}, "lock": threading.Lock()}
+
+
+def _embedding_model(ollama, timeout=1.5):
+    """Installed embedding model name, or None. Probed via /api/tags at most every 10 minutes so a
+    missing model never costs an HTTP round-trip per skill per decision."""
+    now = time.monotonic()
+    with _embed_state["lock"]:
+        if now - _embed_state["checked"] < _EMBED_PROBE_TTL:
+            return _embed_state["model"]
+        _embed_state["checked"] = now
+    found = None
+    try:
+        with urllib.request.urlopen(f"{ollama}/api/tags", timeout=timeout) as resp:
+            names = {str(m.get("name") or m.get("model") or "").lower()
+                     for m in json.loads(resp.read(1_048_576)).get("models", [])}
+        for candidate in EMBEDDING_MODELS:
+            base = candidate.split(":")[0]
+            if candidate in names or any(n == base or n.startswith(base + ":") for n in names):
+                found = candidate
+                break
+    except Exception:
+        found = None
+    with _embed_state["lock"]:
+        _embed_state["model"] = found
+    return found
+
+
 def _get_embedding(text, ollama="http://127.0.0.1:11434", timeout=2):
-    """Try local Ollama embedding models, returning vector or None."""
-    models_to_try = ["qwen3-embedding:0.6b", "nomic-embed-text-v2-moe:latest", "nomic-embed-text"]
-    for emb_model in models_to_try:
-        try:
-            req_data = json.dumps({"model": emb_model, "prompt": text[:512]}).encode("utf-8")
-            req = urllib.request.Request(f"{ollama}/api/embeddings", data=req_data,
-                                         headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read(65536))
-                if "embedding" in data and isinstance(data["embedding"], list):
-                    return data["embedding"]
-        except Exception:
-            continue
-    return None
+    """Embedding vector from the locally installed embedding model, memoized per text, or None."""
+    model = _embedding_model(ollama)
+    if not model:
+        return None
+    key = (model, text[:512])
+    with _embed_state["lock"]:
+        cached = _embed_state["cache"].get(key)
+    if cached is not None:
+        return cached
+    try:
+        req_data = json.dumps({"model": model, "input": text[:512], "keep_alive": "10m"}).encode("utf-8")
+        req = urllib.request.Request(f"{ollama}/api/embed", data=req_data,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read(262_144))
+        vectors = data.get("embeddings")
+        vector = vectors[0] if isinstance(vectors, list) and vectors and isinstance(vectors[0], list) else None
+    except Exception:
+        vector = None
+    if vector is None:
+        return None
+    with _embed_state["lock"]:
+        if len(_embed_state["cache"]) >= _EMBED_CACHE_MAX:
+            _embed_state["cache"].clear()
+        _embed_state["cache"][key] = vector
+    return vector
 
 
 def _bm25_score(query_tokens, doc_tokens, avg_doc_len=15.0):
@@ -721,9 +765,10 @@ class SkillLibrary:
                 db.execute("ALTER TABLE skills ADD COLUMN dry_run_passed INTEGER DEFAULT 1")
             except Exception:
                 pass
-        # Ensure seed skill has status='active'
-        db.execute("UPDATE skills SET status='active' WHERE created=0 AND status='probation'")
+        # Ensure seed skill has status='active' and is never left disabled by older versions
+        db.execute("UPDATE skills SET status='active', disabled=0 WHERE created=0")
         db.commit()
+        self._parsed = {}
 
         if not db.execute("SELECT 1 FROM skills LIMIT 1").fetchone():
             self.install(SEED, created=0, description="Default foundation gathering and survival skill")
@@ -756,8 +801,14 @@ class SkillLibrary:
                                "ORDER BY CASE WHEN created=0 THEN 0 ELSE 1 END, created DESC").fetchall()
         for key, code, status, successes in rows:
             try:
-                value = interpret(parse(code, allow_bounded_repetition=allow_bounded_repetition),
-                                  observation, allow_bounded_repetition=allow_bounded_repetition)
+                cache_key = (key, bool(allow_bounded_repetition))
+                body = self._parsed.get(cache_key)
+                if body is None:
+                    body = parse(code, allow_bounded_repetition=allow_bounded_repetition)
+                    if len(self._parsed) > 64:
+                        self._parsed.clear()
+                    self._parsed[cache_key] = body
+                value = interpret(body, observation, allow_bounded_repetition=allow_bounded_repetition)
                 if value is not None:
                     if not isinstance(value, (dict, list)):
                         raise ValueError("Skill must return an action, a list of actions, or None")
@@ -766,19 +817,32 @@ class SkillLibrary:
                 self.reject(key, str(exc))
 
     def reject(self, key, reason):
+        if self.is_seed(key):
+            # The built-in foundation routine is trusted code; a transient observation mismatch skips it
+            # for this turn instead of silently disabling bootstrap crafting forever.
+            LOG.warning("Foundation skill %s skipped this turn: %s", key, reason)
+            return
         LOG.error("Disabling invalid skill %s: %s", key, reason)
         with self.db:
             self.db.execute("UPDATE skills SET disabled=1, status='disabled' WHERE id=?", (key,))
 
+    def is_seed(self, key):
+        row = self.db.execute("SELECT created FROM skills WHERE id=?", (key,)).fetchone()
+        return bool(row) and row[0] == 0
+
     def outcome(self, decision_id, success):
+        """success may be True, False, or None (interrupted: neither counted)."""
+        if success is None:
+            return
         row = self.db.execute("SELECT skill_id FROM decision_skills WHERE decision_id=?", (decision_id,)).fetchone()
         if not row:
             return
         key = row[0]
         field = "successes" if success else "failures"
         self.db.execute(f"UPDATE skills SET {field}={field}+1 WHERE id=?", (key,))
-        # Existing rule: 3 failures disable a version
-        self.db.execute("UPDATE skills SET disabled=1, status='disabled' WHERE id=? AND failures>=3", (key,))
+        # Three failures disable a generated version; the seed stays available (its targets are
+        # cooled down per situation by the action lookup instead).
+        self.db.execute("UPDATE skills SET disabled=1, status='disabled' WHERE id=? AND failures>=3 AND created>0", (key,))
         # Task B3 Probation promotion: promote to 'active' after 2 observed successes
         if success:
             self.db.execute("UPDATE skills SET status='active' WHERE id=? AND successes>=2 AND status='probation'", (key,))

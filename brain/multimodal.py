@@ -60,6 +60,7 @@ class MultimodalState:
         self.doing = {}
         self.omni_synthesis = ""
         self.emergency_reflex = None
+        self.emergency_time = 0.0
         self.last_update = 0.0
 
     def update_sight(self, sight_data):
@@ -72,6 +73,7 @@ class MultimodalState:
             self.listening = copy.deepcopy(hearing_data)
             if emergency:
                 self.emergency_reflex = emergency
+                self.emergency_time = time.monotonic()
             self.last_update = time.monotonic()
 
     def update_doing(self, doing_data):
@@ -84,10 +86,13 @@ class MultimodalState:
             self.omni_synthesis = str(synthesis_text or "")
             self.last_update = time.monotonic()
 
-    def pop_emergency_reflex(self):
+    def pop_emergency_reflex(self, max_age=3.0):
+        """Reflex computed by the audio worker, or None if it is older than max_age seconds."""
         with self.lock:
             ref = self.emergency_reflex
             self.emergency_reflex = None
+            if ref is not None and time.monotonic() - self.emergency_time > max_age:
+                return None
             return ref
 
     def snapshot(self):

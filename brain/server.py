@@ -294,6 +294,27 @@ def blocked(observation, action, target):
                for row in observation.get("blocked_actions", []))
 
 
+MOVEMENT_ACTIONS = ("goto", "run", "sprint")
+COORD_TARGET = re.compile(r"-?\d+,-?\d+,-?\d+")
+
+
+def stored_target(decision):
+    """Target recorded in the decisions table: movement actions keep their destination so repeated
+    failures block only that spot, not all movement."""
+    target = decision.get("target", "")
+    if target or decision.get("action") not in MOVEMENT_ACTIONS:
+        return target
+    coords = [decision.get(k, 0) for k in "xyz"]
+    return "" if coords == [0, 0, 0] else f"{coords[0]},{coords[1]},{coords[2]}"
+
+
+def memory_target(action, target):
+    """Permanent knowledge is per action kind for movement, not per coordinate."""
+    if action in MOVEMENT_ACTIONS and isinstance(target, str) and COORD_TARGET.fullmatch(target):
+        return ""
+    return target
+
+
 TOOL_TIERS = {
     "wooden": 1,
     "golden": 1,
@@ -590,9 +611,10 @@ def validate_action(decision, observation):
         coord_csv = f"{dest[0]},{dest[1]},{dest[2]}"
         coord_space = f"{dest[0]} {dest[1]} {dest[2]}"
         coord_bracket = f"[{dest[0]}, {dest[1]}, {dest[2]}]"
-        recent_actions = (observation.get("recent_actions") or [])[-4:]
+        # recent_actions is most-recent-first (see Brain.perceive); count the streak from the newest entry.
+        recent_actions = (observation.get("recent_actions") or [])[:4]
         consecutive_gotos = 0
-        for recent in reversed(recent_actions):
+        for recent in recent_actions:
             r_act = recent.get("action") if isinstance(recent, dict) else ("goto" if isinstance(recent, str) and "goto" in recent else "")
             if r_act == "goto":
                 consecutive_gotos += 1
@@ -600,12 +622,14 @@ def validate_action(decision, observation):
                 break
         if consecutive_gotos >= 2:
             raise ValueError("Already executed 2 consecutive goto steps; choose mine, place, craft, pickup or explore instead of circling")
+        coord_short = f"{dest[0]}, {dest[1]}, {dest[2]}"  # BlockPos.toShortString()
         for recent in recent_actions:
             if isinstance(recent, dict) and recent.get("action") == "goto":
-                if recent.get("at") == dest or [recent.get("x"), recent.get("y"), recent.get("z")] == dest:
+                if (recent.get("at") == dest or [recent.get("x"), recent.get("y"), recent.get("z")] == dest
+                        or recent.get("target") == coord_csv):
                     raise ValueError("Repeated goto to the same coordinates; choose mine, place, craft or explore")
                 detail = str((recent.get("result") or {}).get("detail", ""))
-                if coord_csv in detail or coord_space in detail or coord_bracket in detail:
+                if coord_csv in detail or coord_space in detail or coord_bracket in detail or coord_short in detail:
                     raise ValueError("Repeated goto to the same coordinates; choose mine, place, craft or explore")
             elif isinstance(recent, str) and "goto" in recent and (
                 coord_csv in recent or coord_space in recent or coord_bracket in recent
@@ -660,7 +684,7 @@ def validate_action(decision, observation):
             raise ValueError("Do not mine tree leaves; mine logs, stone, or ores, or explore instead")
     if decision["action"] not in allowed_actions(observation):
         raise ValueError("Selected an unavailable action")
-    if blocked(observation, decision["action"], decision["target"]):
+    if blocked(observation, decision["action"], stored_target(decision)):
         raise ValueError("This action failed repeatedly here; change target or position first")
     if decision["action"] == "craft":
         if decision["target"] not in observation.get("craftable", []):
@@ -826,6 +850,8 @@ class Brain:
         self.last_speech_time = 0
         self.strategy_error = ""
         self.thinking = None
+        self.last_rejection = ""
+        self.last_rejection_result_id = None
         self.consecutive_skill_id = None
         self.consecutive_skill_action = None
         self.consecutive_skill_count = 0
@@ -851,9 +877,17 @@ class Brain:
         except Exception as exc:
             LOG.debug("Error during model unload: %s", exc)
 
+    def role_prompt_bytes(self, role="actor"):
+        if self.profile:
+            role_cfg = (self.profile.get("roles") or {}).get(role) or {}
+            if "prompt_bytes" in role_cfg:
+                return int(role_cfg["prompt_bytes"])
+            return int(self.profile.get("prompt_bytes", PROMPT_BYTES))
+        return PROMPT_BYTES
+
     @property
     def prompt_bytes(self):
-        return int(self.profile.get("prompt_bytes", PROMPT_BYTES)) if self.profile else PROMPT_BYTES
+        return self.role_prompt_bytes("actor")
 
     @property
     def bytes_per_token(self):
@@ -996,10 +1030,20 @@ class Brain:
         new_bpt = round(0.7 * old_bpt + 0.3 * measured_bpt, 3)
         profile["bytes_per_token"] = new_bpt
         if "prompt_tokens" in profile:
-            profile["prompt_bytes"] = int(min(
+            new_pb = int(min(
                 modelprofile.PROMPT_BYTES_CAP,
                 max(modelprofile.PROMPT_BYTES_MIN, profile["prompt_tokens"] * new_bpt),
             ))
+            profile["prompt_bytes"] = new_bpt_prompt = new_pb
+            if "roles" in profile:
+                for r_name, r_dict in profile["roles"].items():
+                    if isinstance(r_dict, dict) and "prompt_tokens" in r_dict:
+                        r_dict["prompt_bytes"] = int(min(
+                            modelprofile.PROMPT_BYTES_CAP,
+                            max(modelprofile.PROMPT_BYTES_MIN, r_dict["prompt_tokens"] * new_bpt),
+                        ))
+                    elif isinstance(r_dict, dict):
+                        r_dict["prompt_bytes"] = new_bpt_prompt
         live_p_tps = p_tok / (p_dur / 1e9)
         live_g_tps = g_tok / (g_dur / 1e9)
         old_p_tps = float(profile.get("prompt_tps") or live_p_tps)
@@ -1020,20 +1064,21 @@ class Brain:
             if "strategist" in profile["roles"]:
                 profile["roles"]["strategist"]["timeout"] = profile["timeouts"]["plan_timeout"]
 
-    def inference(self, messages, schema, role, output=None, timeout=None, images=None):
+    def inference(self, messages, schema, role, output=None, timeout=None, images=None, temperature_boost=0.0):
         with self._inference_lock:
             self._active_inferences += 1
             if role == "actor":
                 self._active_actor_inferences += 1
         try:
-            return self._run_inference(messages, schema, role, output=output, timeout=timeout, images=images)
+            return self._run_inference(messages, schema, role, output=output, timeout=timeout, images=images,
+                                       temperature_boost=temperature_boost)
         finally:
             with self._inference_lock:
                 self._active_inferences = max(0, self._active_inferences - 1)
                 if role == "actor":
                     self._active_actor_inferences = max(0, self._active_actor_inferences - 1)
 
-    def _run_inference(self, messages, schema, role, output=None, timeout=None, images=None):
+    def _run_inference(self, messages, schema, role, output=None, timeout=None, images=None, temperature_boost=0.0):
         started = time.monotonic()
         profile = self.ensure_profile(timeout or (self.plan_timeout if role == "strategist" else self.actor_timeout))
         role_cfg = (profile.get("roles") or {}).get(role) or {}
@@ -1080,6 +1125,8 @@ class Brain:
                         strata_schema["properties"]["action"]["enum"] = sorted(actions)
 
             strata_temp = role_cfg.get("temperature", profile["options"].get("temperature", 0.2))
+            if temperature_boost:
+                strata_temp = round(min(1.2, float(strata_temp or 0.2) + float(temperature_boost)), 2)
             strata_req = {
                 "model": profile.get("model", "qwen3.8-flash-next-q2_0"),
                 "messages": strata_msgs,
@@ -1125,6 +1172,11 @@ class Brain:
         req_options = dict(profile["options"], num_predict=output)
         if "temperature" in role_cfg and role_cfg["temperature"] is not None:
             req_options["temperature"] = role_cfg["temperature"]
+        if temperature_boost:
+            # Retries after a rejection: a deterministic low temperature would reproduce the same answer.
+            base_temp = req_options.get("temperature")
+            base_temp = float(base_temp) if isinstance(base_temp, (int, float)) else 0.6
+            req_options["temperature"] = round(min(1.2, base_temp + float(temperature_boost)), 2)
 
         request = {
             "model": self.model, "messages": msgs, "format": schema,
@@ -1163,18 +1215,24 @@ class Brain:
             retry_req = dict(request, think=False, options=dict(request["options"], num_predict=non_think_cap))
             payload = _send_ollama(retry_req)
             if payload.get("done_reason") != "length":
-                profile["thinking"] = False
-                profile["think_value"] = False
-                profile["actor_tokens"] = non_think_cap
-                if "actor" in (profile.get("roles") or {}):
-                    profile["roles"]["actor"]["think"] = False
-                    profile["roles"]["actor"]["think_value"] = False
-                    profile["roles"]["actor"]["num_predict"] = non_think_cap
+                # Only the role that ran out of budget stops thinking; the other role keeps its own settings.
+                role_profile = (profile.get("roles") or {}).get(role)
+                if isinstance(role_profile, dict):
+                    role_profile["think"] = False
+                    role_profile["think_value"] = False
+                    role_profile["num_predict"] = non_think_cap
+                if role == "actor":
+                    profile["thinking"] = False
+                    profile["think_value"] = False
+                    profile["actor_tokens"] = non_think_cap
+                else:
+                    profile["plan_tokens"] = non_think_cap
         if payload.get("done_reason") == "length":
             raise ValueError("Model exhausted output budget; refusing partial response")
         self._update_live_metrics(profile, msg_bytes, payload)
-        LOG.info("role=%s prompt_tokens=%s generated_tokens=%s elapsed=%.2fs prompt_tps=%s gen_tps=%s", role,
-                 payload.get("prompt_eval_count"), payload.get("eval_count"), time.monotonic() - started,
+        LOG.info("role=%s prompt_tokens=%s cached=%s generated_tokens=%s elapsed=%.2fs prompt_tps=%s gen_tps=%s", role,
+                 payload.get("prompt_eval_count"), payload.get("prompt_eval_cached_count", "-"),
+                 payload.get("eval_count"), time.monotonic() - started,
                  rate(payload.get("prompt_eval_count"), payload.get("prompt_eval_duration")),
                  rate(payload.get("eval_count"), payload.get("eval_duration")))
         return json.loads(payload["message"]["content"])
@@ -1352,10 +1410,11 @@ class Brain:
                 snapshot[fname] = snapshot[fname][:cap]
         # The worker receives immutable serialized data and never touches SQLite.
         system = PLAN_SYSTEM_COMPACT if self.prompt_tokens < self.compact_threshold_tokens else PLAN_SYSTEM
+        plan_budget = self.role_prompt_bytes("strategist")
         while True:
             plan_messages = [{"role": "system", "content": system},
                              {"role": "user", "content": compact(snapshot)}]
-            if len(compact(plan_messages).encode()) + len(compact(PLAN_SCHEMA).encode()) <= self.prompt_bytes:
+            if len(compact(plan_messages).encode()) + len(compact(PLAN_SCHEMA).encode()) <= plan_budget:
                 break
             fields = [key for key in list_fields if isinstance(snapshot.get(key), list) and snapshot[key]]
             if not fields:
@@ -1376,7 +1435,7 @@ class Brain:
                     continue
                 plan_messages = [{"role": "system", "content": system},
                                  {"role": "user", "content": compact(snapshot)}]
-                if len(compact(plan_messages).encode()) + len(compact(PLAN_SCHEMA).encode()) <= self.prompt_bytes:
+                if len(compact(plan_messages).encode()) + len(compact(PLAN_SCHEMA).encode()) <= plan_budget:
                     break
                 LOG.error("Strategist skipped: essential snapshot exceeds context budget")
                 self.planner_status = "strategist snapshot oversized"
@@ -1404,10 +1463,12 @@ class Brain:
         if not row or row[3] is not None:
             return
         delta = self.experience.learn(decision_id, row[0], row[1], observation)
-        self.memory.record(result.get("action", row[0]), row[1], result, delta, observation.get("dimension", "unknown"))
+        self.memory.record(result.get("action", row[0]), memory_target(row[0], row[1]), result, delta,
+                           observation.get("dimension", "unknown"))
         encoded = compact(dict(result, inventory_change=delta or {}))
         self.db.execute("UPDATE decisions SET result=? WHERE id=?", (encoded, decision_id))
-        self.skills.outcome(decision_id, result.get("status") == "success")
+        status = result.get("status")
+        self.skills.outcome(decision_id, None if status == "interrupted" else status == "success")
         skill_row = self.db.execute("SELECT skill_id FROM decision_skills WHERE decision_id=?", (decision_id,)).fetchone()
         if skill_row:
             if bool(delta):
@@ -1417,6 +1478,9 @@ class Brain:
         else:
             self.consecutive_skill_no_progress = 0
         # Store observed outcomes separately from model-authored hypotheses.
+        if status == "interrupted":
+            self.db.commit()
+            return
         lesson = (f"{result.get('action', row[0])} {row[1]}: {result.get('status', '')} "
                   f"{str(result.get('detail', ''))[:160]}")
         if "damage" in result:
@@ -1428,6 +1492,15 @@ class Brain:
             (self.lessons_cap,),
         )
         self.db.commit()
+
+    def recent_actions(self, limit):
+        return [
+            {"action": row[0], "target": row[1], "result": json.loads(row[2])}
+            for row in self.db.execute(
+                "SELECT action,target,result FROM decisions WHERE result IS NOT NULL ORDER BY created DESC LIMIT ?",
+                (int(limit),),
+            )
+        ]
 
     def perceive(self, observation):
         self.record_result(observation)
@@ -1441,6 +1514,9 @@ class Brain:
             context = self.pipeline.enrich(context)
         context["lookup"], context["blocked_actions"] = self.experience.context(observation)
         context["inventory_change"] = self.experience.changes(observation)
+        # Most-recent-first outcome history; validate_action uses it to break goto/explore loops.
+        if "recent_actions" not in context:
+            context["recent_actions"] = self.recent_actions(_scaled_count(20, self.trim_scale, low=6, high=32))
         counts = inventory(observation)
         pos = observation.get("position")
         sites = observation.get("crafting", {}).get("placement_sites", [])
@@ -1501,43 +1577,57 @@ class Brain:
             )
         return context
 
-    def messages(self, observation, correction=""):
+    def messages(self, observation, correction="", role="actor"):
         if "milestones" not in observation:
             observation = self.perceive(observation)
         scale = self.trim_scale
+        target_budget = self.role_prompt_bytes(role)
         lesson_limit = _scaled_count(12, scale, low=4, high=24)
         recent_limit = _scaled_count(20, scale, low=6, high=32)
         goal = self.db.execute("SELECT value FROM state WHERE key='goal'").fetchone()
         lessons = [r[0] for r in self.db.execute(
             "SELECT text FROM lessons ORDER BY used DESC LIMIT ?", (lesson_limit,)
         )]
-        allowed = ("position", "health", "food", "time", "inventory", "nearby_blocks", "visible_tree",
-                   "entities", "craftable", "smeltable", "trades", "crafting", "last_result", "chat", "dimension",
-                   "terrain", "diagnosis", "on_ground", "in_water", "air", "weather", "biome", "lookup",
-                   "blocked_actions", "inventory_change", "milestones", "placeable", "seeing", "listening", "doing",
-                   "sight", "hearing", "active_tools", "lfm_omni_synthesis")
-        context = {k: copy.deepcopy(observation[k]) for k in allowed if k in observation}
+        # Key order matters for local inference: Ollama reuses the KV cache for the longest unchanged
+        # prefix, so slow-changing memory/goal data comes first and per-tick sensor data comes last.
+        stable_keys = ("lookup", "blocked_actions", "milestones")
+        slow_keys = ("dimension", "biome", "inventory", "placeable", "inventory_change", "craftable", "smeltable",
+                     "trades", "crafting")
+        volatile_keys = ("position", "health", "food", "air", "on_ground", "in_water", "time", "weather", "terrain",
+                         "diagnosis", "nearby_blocks", "visible_tree", "entities", "seeing", "listening", "doing",
+                         "sight", "hearing", "lfm_omni_synthesis", "active_tools", "last_result", "chat")
+        observed = {k: copy.deepcopy(observation[k]) for k in stable_keys + slow_keys + volatile_keys if k in observation}
+        # The pipeline mirrors sight->seeing and hearing->listening; sending both wastes prompt tokens.
+        if "seeing" in observed:
+            observed.pop("sight", None)
+        if "listening" in observed:
+            observed.pop("hearing", None)
         for key in ("seeing", "sight"):
-            if key in context and isinstance(context[key], dict):
-                context[key].pop("snapshot_png_base64", None)
-        if "craftable" in context:
-            context["craftable"] = craft_targets(observation)
-        if correction:
-            context["correction"] = str(correction)[:DECISION_LIMITS["memory"]]
-        context["saved_goal"] = goal[0] if goal else "Gather wood and establish a safe survival base."
+            if key in observed and isinstance(observed[key], dict):
+                observed[key].pop("snapshot_png_base64", None)
+        if "craftable" in observed:
+            observed["craftable"] = craft_targets(observation)
         strategy = self.db.execute("SELECT value FROM state WHERE key='strategy'").fetchone()
+        if isinstance(observation.get("recent_actions"), list):
+            recent_actions = copy.deepcopy(observation["recent_actions"][:recent_limit])
+        else:
+            recent_actions = self.recent_actions(recent_limit)
+
+        context = {"saved_goal": goal[0] if goal else "Gather wood and establish a safe survival base."}
         if strategy:
             context["strategy"] = json.loads(strategy[0])
         context["strategist_status"] = self.planner_status
-        context["observed_lessons"] = lessons
-        context["recent_actions"] = [
-            {"action": row[0], "target": row[1], "result": json.loads(row[2])}
-            for row in self.db.execute(
-                "SELECT action,target,result FROM decisions WHERE result IS NOT NULL ORDER BY created DESC LIMIT ?",
-                (recent_limit,),
-            )
-        ]
         context.update(self.memory.context(observation))
+        context["observed_lessons"] = lessons
+        for key in stable_keys + slow_keys:
+            if key in observed:
+                context[key] = observed[key]
+        context["recent_actions"] = recent_actions
+        for key in volatile_keys:
+            if key in observed:
+                context[key] = observed[key]
+        if correction:
+            context["correction"] = str(correction)[:DECISION_LIMITS["memory"]]
 
         # Explicit active tools declaration for tool awareness
         seeing_info = context.get("seeing") or {}
@@ -1565,7 +1655,7 @@ class Brain:
         aud_insight = listening_info.get("audio_insight") or listening_info.get("lfm_audio_insight")
         if aud_insight:
             active_tools["hearing"]["insight"] = aud_insight
-        omni_syn = context.get("omni_synthesis") or context.get("lfm_omni_synthesis")
+        omni_syn = context.pop("lfm_omni_synthesis", None) or observation.get("omni_synthesis")
         if omni_syn:
             active_tools["omni_synthesis"] = omni_syn
         context["active_tools"] = active_tools
@@ -1667,7 +1757,7 @@ class Brain:
                 # Cache-friendly prompt ordering: static instructions/rules first, volatile observation last
                 messages = [{"role": "system", "content": system_prompt},
                             {"role": "user", "content": compact(context)}]
-                if len(compact(messages).encode()) + schema_bytes <= self.prompt_bytes:
+                if len(compact(messages).encode()) + schema_bytes <= target_budget:
                     return messages
                 candidates = [key for key, minimum in minimums.items()
                               if isinstance(context.get(key), list) and len(context[key]) > minimum]
@@ -1678,7 +1768,7 @@ class Brain:
 
         messages = [{"role": "system", "content": system_prompt},
                     {"role": "user", "content": compact(context)}]
-        if len(compact(messages).encode()) + schema_bytes <= self.prompt_bytes:
+        if len(compact(messages).encode()) + schema_bytes <= target_budget:
             return messages
         raise ValueError("Essential observation exceeds context budget")
 
@@ -1799,8 +1889,17 @@ class Brain:
                                 (reflex_id, time.time(), reflex["action"], reflex["target"],
                                  reflex["goal"], reflex["memory"]))
             return reflex
+        self.ensure_profile(timeout=self.actor_timeout)
         self.update_planner(observation)
-        messages = self.messages(observation)
+        # A plan rejected on the previous request (HTTP 422) executed nothing, so last_result is unchanged;
+        # remind the model why, otherwise a low-temperature model tends to repeat the same invalid answer.
+        correction = ""
+        retry_heat = 0.0
+        if self.last_rejection and observation.get("last_result", {}).get("id") == self.last_rejection_result_id:
+            correction = (f"Your previous plan was rejected and NOT executed: {self.last_rejection[:160]}. "
+                          "Choose a different valid action from the CURRENT observation.")
+            retry_heat = 0.3
+        messages = self.messages(observation, correction=correction, role="actor")
         started = time.monotonic()
         decision = None
         skill_id = None
@@ -1869,7 +1968,8 @@ class Brain:
                     if remaining <= 0:
                         raise TimeoutError("Actor correction deadline exceeded")
                     raw = self.inference(
-                        messages, action_schema(observation), "actor", timeout=remaining, images=images)
+                        messages, action_schema(observation), "actor", timeout=remaining, images=images,
+                        temperature_boost=retry_heat + (0.3 if attempt else 0.0))
                     decision = validate_action(raw, observation)
                     decision = self._augment_tree_and_plan(decision, observation, from_actor=True)
                     break
@@ -1899,12 +1999,14 @@ class Brain:
                             break
                     if attempt:
                         LOG.warning("Model plan rejected; no action executed: %s (raw response: %s)", exc, raw)
+                        self.last_rejection = str(exc)
+                        self.last_rejection_result_id = observation.get("last_result", {}).get("id")
                         raise DecisionRejected(str(exc)) from exc
                     LOG.warning("Rejected actor response; requesting one correction: %s (raw response: %s)", exc, raw)
                     messages = self.messages(observation, correction=(
                         f"Previous response rejected: {str(exc)[:160]}. Choose a valid action from the CURRENT "
                         "observation. Use only unblocked targets. For placement use an owned placeable block "
-                        "at one of crafting.placement_sites. No action was executed."))
+                        "at one of crafting.placement_sites. No action was executed."), role="actor")
         if decision.get("plan"):
             self.steps = list(decision["plan"])
             self.steps_goal = decision["goal"]
@@ -1912,6 +2014,8 @@ class Brain:
             self.steps_deadline = time.monotonic() + self.steps_deadline_seconds
             self.steps_health = observation.get("health", 20)
             self.steps_food = observation.get("food", 20)
+        self.last_rejection = ""
+        self.last_rejection_result_id = None
         if skill_id:
             self.consecutive_skill_count += 1
             if self.consecutive_skill_id != skill_id:
@@ -1962,7 +2066,7 @@ class Brain:
         decision_id = str(uuid.uuid4())
         with self.db:
             self.db.execute("INSERT INTO decisions VALUES (?,?,?,?,?,?,NULL)",
-                            (decision_id, time.time(), decision["action"], decision["target"],
+                            (decision_id, time.time(), decision["action"], stored_target(decision),
                              decision["goal"], decision["memory"]))
             self.db.execute("INSERT OR REPLACE INTO state VALUES ('goal',?)", (decision["goal"],))
             self.experience.remember(decision_id, observation)

@@ -52,6 +52,7 @@ class Memory:
     def __init__(self, db, export_path=None):
         self.db = db
         self.export_path = Path(export_path) if export_path else None
+        self._observations_since_prune = 0
         db.executescript("""
             CREATE TABLE IF NOT EXISTS placed_blocks
               (dimension TEXT, x INTEGER, y INTEGER, z INTEGER, block TEXT, placed REAL,
@@ -147,10 +148,16 @@ class Memory:
             else:
                 self.db.execute("DELETE FROM seen_blocks WHERE dimension=? AND x=? AND y=? AND z=?",
                                 (dimension, *at))
-        self.prune()
+        # Caps are generous, so five COUNT(*) scans per decision are unnecessary; prune periodically.
+        self._observations_since_prune += 1
+        if self._observations_since_prune >= 25:
+            self._observations_since_prune = 0
+            self.prune()
 
     def record(self, action, target, result, delta, dimension):
         """Stores an action's measured outcome permanently and keeps the placed-block map exact."""
+        if result.get("status") == "interrupted":
+            return
         now = time.time()
         success = result.get("status") == "success"
         detail = str(result.get("detail", ""))[:240]

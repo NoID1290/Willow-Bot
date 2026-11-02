@@ -147,8 +147,8 @@ public final class AcousticSensor {
                 HISTORY.removeFirst();
             }
         }
-        if ("CRITICAL".equals(urgency) || "WARNING".equals(urgency) || (distance < 12.0 && volume > 0.3f)) {
-            LocalAiMod.LOG.info("Willow heard {} (dist={:.1f}m, bearing={}, urgency={})", soundId, distance, bearing, urgency);
+        if ("CRITICAL".equals(urgency) || "WARNING".equals(urgency)) {
+            LocalAiMod.LOG.info("Willow heard {} (dist={}m, bearing={}, urgency={})", soundId, record.distance(), bearing, urgency);
         }
     }
 

@@ -9,7 +9,10 @@ final class ProgressTracker {
     private int failures;
     private int recoveryAttempts;
 
-    void record(String action, boolean success, BlockPos position) {
+    void record(String action, String status, BlockPos position) {
+        // Interruptions (eating reflex, player chat, pause) are not evidence of being stuck.
+        if ("interrupted".equals(status)) return;
+        boolean success = "success".equals(status);
         if (action.equals("escape")) recoveryAttempts++;
         if (!success) failures++;
         else failures = 0;

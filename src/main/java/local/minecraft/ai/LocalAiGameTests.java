@@ -249,13 +249,15 @@ public final class LocalAiGameTests {
     @GameTest
     public void detectCircularProgress(GameTestHelper helper) {
         ProgressTracker tracker = new ProgressTracker();
-        for (int i = 0; i < 7; i++) tracker.record("explore", true, new BlockPos(i % 2, 70, i % 3));
+        for (int i = 0; i < 7; i++) tracker.record("explore", "success", new BlockPos(i % 2, 70, i % 3));
         helper.assertTrue(tracker.problem().isEmpty(), "Do not diagnose a loop before the threshold");
-        tracker.record("explore", true, BlockPos.containing(0, 70, 0));
+        tracker.record("explore", "success", BlockPos.containing(0, 70, 0));
         helper.assertFalse(tracker.problem().isEmpty(), "Successful movement in circles is still stuck");
-        tracker.record("escape", true, new BlockPos(4, 65, 0));
+        tracker.record("escape", "success", new BlockPos(4, 65, 0));
         helper.assertTrue(tracker.problem().isEmpty(), "Recovery success clears the old movement loop");
-        for (int i = 0; i < 3; i++) tracker.record("goto", false, new BlockPos(4, 65, 0));
+        for (int i = 0; i < 3; i++) tracker.record("mine", "interrupted", new BlockPos(4, 65, 0));
+        helper.assertTrue(tracker.problem().isEmpty(), "Eating/chat interruptions are not failures");
+        for (int i = 0; i < 3; i++) tracker.record("goto", "failed", new BlockPos(4, 65, 0));
         helper.assertFalse(tracker.problem().isEmpty(), "Three failures must diagnose a problem");
         helper.assertTrue(new LocalAiMod.Config().thinkIntervalTicks == 0,
                 "No artificial scheduling wait after an action");

@@ -52,6 +52,7 @@ final class Actions {
     private net.minecraft.world.item.Item pickupItem;
     private int pickupBefore;
     private String targetName = "";
+    private net.minecraft.world.level.block.Block targetBlock;
     private int miningRepositions;
     private List<BlockPos> watched = List.of();
     private final SightPerception sightPerception = new SightPerception();
@@ -72,7 +73,12 @@ final class Actions {
     }
 
     void stop(String reason) {
-        if (busy()) finish(false, reason);
+        stop(reason, false);
+    }
+
+    /** Ends the current action; {@code failed} marks a real failure (e.g. death) rather than an interruption. */
+    void stop(String reason, boolean failed) {
+        if (busy()) finish(failed ? "failed" : "interrupted", reason);
         pack().stopAll();
         pack().setSprinting(false);
         pack().setSneaking(false);
@@ -153,6 +159,7 @@ final class Actions {
         pack().setSneaking(false);
         ticks = 0;
         target = null;
+        targetBlock = null;
         walking = false;
         pillaring = false;
         pillarPlaced = false;
@@ -1160,7 +1167,13 @@ final class Actions {
                 case "mine", "escape" -> {
                     if (pillaring) {
                         handlePillaringTick();
-                    } else if (escapeBlockBroken || player.level().getBlockState(target).isAir()) {
+                        break;
+                    }
+                    var targetState = player.level().getBlockState(target);
+                    if (targetBlock == null && !targetState.isAir()) targetBlock = targetState.getBlock();
+                    // A broken block may be replaced by water, falling gravel or a plant rather than air.
+                    boolean blockGone = targetState.isAir() || (targetBlock != null && !targetState.is(targetBlock));
+                    if (escapeBlockBroken || blockGone) {
                         if (action.equals("escape")) {
                             if (!escapeBlockBroken) {
                                 escapeBlockBroken = true;
@@ -1319,12 +1332,16 @@ final class Actions {
     }
 
     private void finish(boolean success, String detail) {
+        finish(success ? "success" : "failed", detail);
+    }
+
+    private void finish(String status, String detail) {
         pack().stopAll();
         pillaring = false;
         pillarPlaced = false;
         result = new JsonObject();
         result.addProperty("id", id);
-        result.addProperty("status", success ? "success" : "failed");
+        result.addProperty("status", status);
         result.addProperty("detail", detail);
         result.addProperty("action", action);
         result.addProperty("target", targetName);
@@ -1334,8 +1351,8 @@ final class Actions {
         result.addProperty("health_after", player.getHealth());
         result.addProperty("damage", Math.max(0, healthBefore - player.getHealth()));
         result.addProperty("position", player.blockPosition().toShortString());
-        progress.record(action, success, player.blockPosition());
-        LocalAiMod.LOG.info("Willow action {}: {}", action, detail);
+        progress.record(action, status, player.blockPosition());
+        LocalAiMod.LOG.info("Willow action {} {}: {}", action, status, detail);
         action = "";
     }
 

@@ -639,6 +639,84 @@ class BrainTests(unittest.TestCase):
             validate_action(decision(action="mine", target="minecraft:oak_leaves", x=-143, y=65, z=-1103),
                             dict(obs, inventory=[]))
 
+    def test_goto_destination_is_remembered_and_loop_guard_uses_live_history(self):
+        obs = {"position": [100, 64, 100], "dimension": "minecraft:overworld", "nearby_blocks": [],
+               "inventory": [], "health": 20, "food": 20}
+        with patch.object(self.brain, "inference", return_value=decision(action="goto", x=110, y=64, z=100)):
+            first = self.brain.decide(obs)
+        self.assertEqual(first["action"], "goto")
+        stored = self.brain.db.execute("SELECT target FROM decisions WHERE id=?", (first["id"],)).fetchone()[0]
+        self.assertEqual(stored, "110,64,100", "Movement destinations are stored per decision")
+        after = dict(obs, position=[104, 64, 100],
+                     last_result={"id": first["id"], "status": "failed", "detail": "No safe walking path to 110, 64, 100",
+                                  "action": "goto", "target": ""})
+        perceived = self.brain.perceive(after)
+        self.assertTrue(perceived["recent_actions"], "perceive() supplies history so validate_action can see it")
+        with self.assertRaisesRegex(ValueError, "Repeated goto"):
+            validate_action(decision(action="goto", x=110, y=64, z=100), perceived)
+        # Other destinations stay allowed and the per-coordinate memory does not pollute knowledge.
+        validate_action(decision(action="goto", x=95, y=64, z=100), perceived)
+        knowledge = self.brain.db.execute("SELECT target FROM knowledge WHERE action='goto'").fetchall()
+        self.assertEqual(knowledge, [("",)])
+
+    def test_interrupted_results_are_not_failures(self):
+        obs = {"position": [0, 64, 0], "dimension": "minecraft:overworld", "inventory": [],
+               "nearby_blocks": [{"id": "minecraft:stone", "at": [1, 64, 0]}], "health": 20, "food": 20}
+        with patch.object(self.brain, "inference", return_value=decision(action="mine", target="minecraft:stone")):
+            dec = self.brain.decide(obs)
+        interrupted = dict(obs, last_result={"id": dec["id"], "status": "interrupted", "action": "mine",
+                                             "target": "minecraft:stone", "detail": "Interrupted to eat"})
+        self.brain.perceive(interrupted)
+        self.assertEqual(self.brain.db.execute("SELECT COUNT(*) FROM action_lookup").fetchone()[0], 0)
+        self.assertEqual(self.brain.db.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0], 0)
+        self.assertEqual(self.brain.db.execute("SELECT COUNT(*) FROM lessons").fetchone()[0], 0)
+
+    def test_rejection_reason_is_carried_into_the_next_request(self):
+        obs = {"position": [0, 64, 0], "dimension": "minecraft:overworld", "inventory": [],
+               "nearby_blocks": [{"id": "minecraft:stone", "at": [1, 64, 0]}], "health": 20, "food": 20,
+               "last_result": {"id": "prev", "status": "success"}}
+        from server import DecisionRejected
+        bad = decision(action="mine", target="minecraft:diamond_ore")
+        with patch.object(self.brain, "inference", return_value=bad):
+            with self.assertRaises(DecisionRejected):
+                self.brain.decide(obs)
+        calls = []
+
+        def fake(messages, schema, role, **kwargs):
+            calls.append((json.loads(messages[-1]["content"]), kwargs))
+            return decision(action="mine", target="minecraft:stone")
+
+        with patch.object(self.brain, "inference", side_effect=fake):
+            dec = self.brain.decide(obs)
+        self.assertEqual(dec["action"], "mine")
+        self.assertIn("rejected and NOT executed", calls[0][0]["correction"])
+        self.assertGreater(calls[0][1]["temperature_boost"], 0)
+
+    def test_seed_skill_survives_repeated_failures(self):
+        seed = self.brain.db.execute("SELECT id FROM skills WHERE created=0").fetchone()[0]
+        for i in range(4):
+            self.brain.db.execute("INSERT INTO decisions VALUES (?,?,?,?,?,?,NULL)", (f"s{i}", i, "pickup", "", "", ""))
+            self.brain.db.execute("INSERT INTO decision_skills VALUES (?,?)", (f"s{i}", seed))
+            self.brain.skills.outcome(f"s{i}", False)
+        self.brain.skills.reject(seed, "transient mismatch")
+        self.assertEqual(self.brain.db.execute("SELECT disabled FROM skills WHERE id=?", (seed,)).fetchone()[0], 0)
+
+    def test_prompt_sends_sensors_once_and_stable_sections_first(self):
+        obs = {
+            "position": [1, 64, 1], "inventory": ["minecraft:oak_log=2"], "nearby_blocks": [],
+            "sight": {"looking_at": {"id": "minecraft:oak_log"}, "visible_entities": [], "snapshot_png_base64": "AAAA"},
+            "hearing": {"active_alerts": [], "recent_sounds": []},
+        }
+        ctx = json.loads(self.brain.messages(obs)[-1]["content"])
+        self.assertIn("seeing", ctx)
+        self.assertNotIn("sight", ctx, "raw sight is mirrored into seeing; do not send both")
+        self.assertNotIn("hearing", ctx)
+        self.assertNotIn("snapshot_png_base64", json.dumps(ctx))
+        keys = list(ctx)
+        self.assertLess(keys.index("saved_goal"), keys.index("inventory"))
+        self.assertLess(keys.index("inventory"), keys.index("position"))
+        self.assertEqual(keys[-1], "active_tools")
+
 
 if __name__ == "__main__":
     unittest.main()

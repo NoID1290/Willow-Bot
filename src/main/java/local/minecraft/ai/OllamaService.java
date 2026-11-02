@@ -78,19 +78,39 @@ public final class OllamaService {
 
     /** Preloads model weights into GPU VRAM in background. */
     public void preload(String model) {
+        preload(model, 0);
+    }
+
+    /**
+     * Preloads the model with the context size the brain will use. Ollama restarts the runner whenever
+     * num_ctx changes, so loading with an unknown context would only add a second load; in that case the
+     * brain's own startup benchmark performs the single warm load.
+     */
+    public void preload(String model, int numCtx) {
+        preload(model, numCtx, 0);
+    }
+
+    public void preload(String model, int numCtx, int numThread) {
         if (model == null || model.isBlank()) return;
         if (model.toLowerCase(java.util.Locale.ROOT).contains("strata")) return;
-        Thread.startVirtualThread(() -> {
-            try (var http = client()) {
-                JsonObject request = new JsonObject();
-                request.addProperty("model", model);
-                request.addProperty("keep_alive", "24h");
-                http.send(HttpRequest.newBuilder(base.resolve("/api/generate"))
-                        .timeout(Duration.ofSeconds(120)).header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(request.toString())).build(),
-                        HttpResponse.BodyHandlers.discarding());
-            } catch (Exception ignored) {}
-        });
+        if (numCtx > 0) {
+            Thread.startVirtualThread(() -> {
+                try (var http = client()) {
+                    JsonObject request = new JsonObject();
+                    request.addProperty("model", model);
+                    request.addProperty("keep_alive", "15m");
+                    JsonObject options = new JsonObject();
+                    options.addProperty("num_ctx", numCtx);
+                    // Ollama's runner also restarts when num_thread differs from the brain's requests.
+                    if (numThread > 0) options.addProperty("num_thread", numThread);
+                    request.add("options", options);
+                    http.send(HttpRequest.newBuilder(base.resolve("/api/generate"))
+                            .timeout(Duration.ofSeconds(120)).header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString(request.toString())).build(),
+                            HttpResponse.BodyHandlers.discarding());
+                } catch (Exception ignored) {}
+            });
+        }
         if (isLfmFamily(model)) {
             preloadLfmFamily();
         }
