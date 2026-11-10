@@ -277,6 +277,7 @@ def dry_run(code, observations, validate_action_fn=None, allow_bounded_repetitio
     if not observations:
         return True, "No past observations to dry-run"
 
+    returned_actions = []
     for idx, obs in enumerate(observations):
         try:
             val = interpret(body, obs, allow_bounded_repetition=allow_bounded_repetition)
@@ -289,14 +290,20 @@ def dry_run(code, observations, validate_action_fn=None, allow_bounded_repetitio
                             return False, f"Observation {idx} action {a_idx}: Returned item is not a dict"
                         if validate_action_fn:
                             validate_action_fn(act, obs)
+                        returned_actions.append(act.get("action"))
                 elif isinstance(val, dict):
                     if validate_action_fn:
                         validate_action_fn(val, obs)
+                    returned_actions.append(val.get("action"))
                 else:
                     return False, f"Observation {idx}: Skill returned invalid type {type(val).__name__}"
         except Exception as exc:
             return False, f"Observation {idx}: {exc}"
 
+    # `return explore()` with no guard passes every check yet turns Willow into a random walker.
+    if returned_actions and len(returned_actions) == len(observations) and set(returned_actions) <= {"explore", "wait"}:
+        return False, ("Skill returns explore/wait for every observation; it must be conditional on inventory, "
+                       "nearby blocks or drops and should usually return a gathering or crafting action")
     return True, "Dry run passed"
 
 

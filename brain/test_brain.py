@@ -718,6 +718,45 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(keys[-1], "active_tools")
         self.assertNotIn("reminder", ctx["milestones"])
 
+    def test_unreachable_stone_is_not_a_mine_target_and_tunnel_down_is_offered(self):
+        obs = {
+            "position": [-10, 63, -80], "dimension": "minecraft:overworld", "health": 20, "food": 20,
+            "inventory": ["minecraft:wooden_pickaxe=1", "minecraft:oak_planks=6"],
+            "nearby_blocks": [
+                {"id": "minecraft:stone", "at": [-9, 59, -79], "visible": False, "reachable": False},
+                {"id": "minecraft:dirt", "at": [-11, 62, -80], "visible": True, "reachable": True},
+            ],
+            "crafting": {"next_step": {"action": "tunnel", "target": "", "x": -10, "y": 59, "z": -80}},
+            "entities": [], "craftable": [],
+        }
+        self.assertEqual(action_targets(obs, "mine"), ["minecraft:dirt"])
+        with self.assertRaisesRegex(ValueError, "no reachable standing position"):
+            validate_action(decision(action="mine", target="minecraft:stone", x=-9, y=59, z=-79), obs)
+        self.assertIn("tunnel", allowed_actions(obs), "a pickaxe owner may always dig")
+        dug = validate_action(decision(action="tunnel", x=-10, y=59, z=-80), obs)
+        self.assertEqual(dug["action"], "tunnel")
+        # The foundation routine follows crafting.next_step, so the seed skill digs without an LLM call.
+        with patch.object(self.brain, "inference", side_effect=AssertionError("model must not be called")):
+            dec = self.brain.decide(obs)
+        self.assertEqual((dec["action"], dec["y"]), ("tunnel", 59))
+
+    def test_blind_explore_steps_are_dropped_from_plans(self):
+        plan = [dict(action="explore", target="", x=0, y=0, z=0), dict(action="wait", target="", x=0, y=0, z=0),
+                dict(action="explore", target="", x=100, y=64, z=100), dict(action="mine", target="minecraft:stone", x=0, y=0, z=0)]
+        res = validate_decision(decision(action="explore", plan=plan))
+        self.assertEqual([s["action"] for s in res["plan"]], ["explore", "mine"])
+        self.assertEqual(res["plan"][0]["x"], 100)
+
+    def test_unconditional_explore_skill_fails_dry_run(self):
+        from skills import dry_run
+        obs = {"position": [0, 64, 0], "inventory": [], "nearby_blocks": [], "entities": []}
+        ok, reason = dry_run("def skill():\n    return explore()\n", [obs, obs], validate_action_fn=validate_action)
+        self.assertFalse(ok)
+        self.assertIn("conditional", reason)
+        ok, _ = dry_run("def skill():\n    if count('#logs') > 0:\n        return explore()\n    return None\n",
+                        [obs, obs], validate_action_fn=validate_action)
+        self.assertTrue(ok, "a guarded explore that stays silent on some observations is acceptable")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -45,6 +45,7 @@ from modelprofile import (
     GAMEPLAY_LIMITS,
 )
 from multimodal import ConcurrentPipeline
+from orchestrator import WillowBotOrchestrator
 
 LOG = logging.getLogger("localai")
 STEP = {
@@ -97,7 +98,7 @@ SURVIVAL RULES:
 3. No duplicates: milestones.owned_tools and inventory show completed tools/tables; owned tools are finished milestones, not missing prerequisites. NEVER craft duplicate pickaxes, axes, swords, shovels, hoes, furnaces or crafting_tables already owned, or unrequested redstone/decorative items (levers, buttons, slabs, stairs, walls). Follow crafting.next_step to bootstrap tools; place an inventory crafting_table at crafting.placement_sites for 3x3 recipes. Basics: 1 log -> 4 planks; a crafting_table is 4 planks in the 2x2 grid (no table needed for planks, sticks or the table itself); a wooden_pickaxe is 3 planks + 2 sticks and needs a placed table.
 4. Caves, pits, tunnels & bridges: blocked_actions failed twice here—change target, move to terrain.exits, or alter conditions. If stuck in a cave/hole/pit, use pillar (places a block under your feet to get higher), tunnel (dig 1x2 path forward), bridge (place horizontal path across gaps/water), or escape (may take fall damage or break the block supporting you).
 5. Stockpile & full inventory: stop mining bulk stone/dirt once milestones.enough_building_blocks lists it (those items are ENOUGH; never gather more) or milestones.inventory_free_slots == 0. Use chest to store excess items or retrieve supplies. Collect needed item drops with pickup only when entities contains item drops.
-6. Action semantics: mine (block ID + observed x/y/z or 0,0,0; logs by hand, stone needs pickaxe); craft (exact ID from craftable); smelt (item ID from smeltable); chest (item ID or ""); sleep (use/place bed at night); trade (villager trade item or ""); boat (use/place boat on water); shelter (build protective walls/roof); portal (light/enter portal); place (ID from placeable at exact crafting.placement_sites x/y/z); goto (walk to x/y/z or head toward far global waypoints); run/sprint (fast move, needs food > 6); attack (numeric non-player entity ID).
+6. Action semantics: mine (block ID + observed x/y/z or 0,0,0; logs by hand, stone needs pickaxe; blocks with reachable=false have no standing spot—tunnel toward them instead); craft (exact ID from craftable); smelt (item ID from smeltable); chest (item ID or ""); sleep (use/place bed at night); trade (villager trade item or ""); boat (use/place boat on water); shelter (build protective walls/roof); portal (light/enter portal); place (ID from placeable at exact crafting.placement_sites x/y/z); goto (walk to x/y/z or head toward far global waypoints); run/sprint (fast move, needs food > 6); tunnel (dig a 1x2 passage toward x/y/z; a y below your position digs a safe staircase DOWN—the normal way to reach stone when none is reachable); attack (numeric non-player entity ID). Do not put explore or wait in plan: they need a fresh look each time.
 7. Chat & permanent memory: if chat is nonempty, ALWAYS reply briefly in say and adopt reasonable requests; otherwise state brief sensory/action observations in say. Save new durable facts in memory (shown in my_notes) and named locations (home, base, table, cave, iron) in waypoint. Return JSON only."""
 
 PLAN_SCHEMA = {
@@ -152,8 +153,8 @@ def validate_decision(value):
     for key in ("goal", "say", "memory", "waypoint"):
         limit = DECISION_LIMITS[key]
         # Free text is advisory; trim small models' long prose instead of discarding a valid action.
-        if isinstance(value[key], str) and len(value[key]) > limit:
-            value[key] = value[key][:limit]
+        if isinstance(value[key], str):
+            value[key] = re.sub(r"[\x00-\x1f]+", " ", value[key]).strip()[:limit]
     for key in ("target", "goal", "say", "memory", "waypoint"):
         limit = DECISION_LIMITS[key]
         if not isinstance(value[key], str) or len(value[key]) > limit:
@@ -193,9 +194,13 @@ def validate_decision(value):
         step_clean = {k: step[k] for k in STEP["required"]}
         try:
             validated_step = validate_decision(dict(step_clean, goal=value["goal"], say="", memory=""))
-            valid_plan.append({k: validated_step[k] for k in STEP["required"]})
         except (ValueError, TypeError, KeyError):
             break
+        # Undirected explore/wait steps queued blind become a random walk; they need a fresh observation.
+        if validated_step["action"] == "wait" or (validated_step["action"] == "explore"
+                                                   and [validated_step[k] for k in "xyz"] == [0, 0, 0]):
+            continue
+        valid_plan.append({k: validated_step[k] for k in STEP["required"]})
     value["plan"] = valid_plan
     return value
 
@@ -260,8 +265,9 @@ def allowed_actions(observation):
     has_blocked_exit = any(isinstance(c, dict) and not c.get("standable", True) for c in exits)
     pos = observation.get("position")
     underground = isinstance(pos, list) and len(pos) == 3 and isinstance(pos[1], (int, float)) and pos[1] < 60
+    has_pickaxe = any(k.endswith("_pickaxe") and v > 0 for k, v in counts.items())
     if not (nearby_ids and (observation.get("diagnosis", {}).get("stuck") or has_blocked_exit or underground
-                            or "tunnel" in chat or "dig" in chat)):
+                            or has_pickaxe or "tunnel" in chat or "dig" in chat)):
         available.remove("tunnel")
 
     has_placeable = any(counts.get(item, 0) > 0 for item in observation.get("placeable", []))
@@ -407,6 +413,27 @@ def exit_blocks(observation):
             if isinstance(cell, dict) for key in ("feet", "head")}
 
 
+def exit_dig_cells(observation, block):
+    """Coordinates where mining `block` opens one of the surrounding exit cells (feet or head block)."""
+    cells = []
+    for cell in observation.get("terrain", {}).get("exits", []):
+        if not isinstance(cell, dict) or not (isinstance(cell.get("at"), list) and len(cell["at"]) == 3):
+            continue
+        x, y, z = cell["at"]
+        if cell.get("feet") == block:
+            cells.append([x, y, z])
+        if cell.get("head") == block:
+            cells.append([x, y + 1, z])
+    return cells
+
+
+def enclosed(observation):
+    """No exit cell can be walked into, so digging a wall is the only way out."""
+    return bool(observation.get("diagnosis", {}).get("stuck")) or not any(
+        isinstance(cell, dict) and cell.get("standable")
+        for cell in observation.get("terrain", {}).get("exits", []))
+
+
 def stockpile_full(observation, block):
     """Reason why mining this block gains nothing useful, or an empty string."""
     counts = inventory(observation)
@@ -495,8 +522,12 @@ def action_targets(observation, action):
         exits = exit_blocks(observation)
         stuck = bool(observation.get("diagnosis", {}).get("stuck"))
         leaves_requested = any(w in chat for w in ("leaves", "leaf", "sapling", "apple"))
+        # Walls of a stockpiled block (cave stone, dirt) are only worth digging when there is no way to walk out.
+        dig_out = enclosed(observation)
+        # Blocks the game marks unreachable (e.g. a lake bed) cannot be mined from any standing spot.
         raw_blocks = [block["id"] for block in observation.get("nearby_blocks", []) if isinstance(block, dict)
-                      and (block["id"] in exits or not stockpile_full(observation, block["id"]))]
+                      and ((block["id"] in exits and (dig_out or not stockpile_full(observation, block["id"])))
+                           or (block.get("reachable", True) and not stockpile_full(observation, block["id"])))]
         filtered = [
             b for b in raw_blocks
             if b in exits or (
@@ -671,12 +702,18 @@ def validate_action(decision, observation):
     if decision["action"] == "mine":
         reason = stockpile_full(observation, decision["target"])
         position = [decision[key] for key in ("x", "y", "z")]
-        digging_exit = position != [0, 0, 0] and any(
-            decision["target"] in (cell.get("feet"), cell.get("head")) and cell.get("at") in (
-                position, [position[0], position[1] - 1, position[2]])
-            for cell in observation.get("terrain", {}).get("exits", []) if isinstance(cell, dict))
-        if reason and not digging_exit:
-            raise ValueError(reason)
+        walls = exit_dig_cells(observation, decision["target"])
+        if reason:
+            if not walls or decision["target"] not in action_targets(observation, "mine"):
+                raise ValueError(reason)
+            if position not in walls:
+                # The schema offers a stockpiled block only as the wall of an enclosed spot; dig that wall
+                # rather than the floor or ceiling the model happens to be looking at.
+                wall = next((c for c in walls if c[0] == position[0] and c[2] == position[2]), walls[0])
+                LOG.info("Mine %s at %s redirected to the exit wall at %s", decision["target"], position, wall)
+                decision.update(x=wall[0], y=wall[1], z=wall[2])
+                position = wall
+        digging_exit = position in walls
         chat = " ".join(observation.get("chat", [])).lower()
         if (decision["target"].endswith("_leaves") and not digging_exit
                 and not observation.get("diagnosis", {}).get("stuck")
@@ -694,12 +731,15 @@ def validate_action(decision, observation):
     if decision["action"] == "mine" and decision["target"] not in {
             block["id"] for block in observation.get("nearby_blocks", []) if isinstance(block, dict)}:
         raise ValueError("Mine target is not currently observed")
+    if decision["action"] == "mine" and decision["target"] not in action_targets(observation, "mine"):
+        raise ValueError("Mine target has no reachable standing position from here; tunnel toward it "
+                         "(a lower y digs a staircase down) or choose another block")
     position = [decision[key] for key in ("x", "y", "z")]
     if decision["action"] == "mine" and position != [0, 0, 0]:
         seen = any(block.get("id") == decision["target"] and block.get("at") == position
+                   and block.get("reachable", True)
                    for block in observation.get("nearby_blocks", []) if isinstance(block, dict))
-        exit_block = any(cell.get("feet") == decision["target"] and cell.get("at") == position
-                         for cell in observation.get("terrain", {}).get("exits", []))
+        exit_block = position in exit_dig_cells(observation, decision["target"])
         if not seen and not exit_block:
             # A stale coordinate still names an observed block type: let the bot pick the nearest one.
             LOG.info("Mine coordinate %s is no longer observed; using automatic %s selection", position,
@@ -861,8 +901,15 @@ class Brain:
         self._active_actor_inferences = 0
         self._hardware = None
         self.pipeline = ConcurrentPipeline(model=self.model, profile=self.profile, ollama=self.ollama)
+        self.orchestrator = WillowBotOrchestrator(
+            storage_dir=Path(database).parent,
+            resident_model=self.model,
+            ollama_url=self.ollama,
+        )
 
     def close(self):
+        if hasattr(self, "orchestrator") and self.orchestrator:
+            self.orchestrator.stop()
         if hasattr(self, "pipeline") and self.pipeline:
             self.pipeline.close()
         if self.planner:
@@ -1528,6 +1575,7 @@ class Brain:
             if isinstance(b, dict) and isinstance(b.get("id"), str)
             and b["id"].endswith(("_log", "_stem"))
             and isinstance(b.get("at"), list) and len(b["at"]) == 3
+            and b.get("reachable", True)
             and not blocked(observation, "mine", b["id"])
         ]
         logs_total = sum(v for k, v in counts.items() if k.endswith(("_log", "_stem")))
@@ -1571,6 +1619,13 @@ class Brain:
                 "You already own a wooden_pickaxe! Stop chopping trees or crafting planks/wood; "
                 "mine minecraft:stone (or explore/tunnel to find exposed stone) to gather 3 cobblestone for a stone_pickaxe."
             )
+        if hasattr(self, "orchestrator") and self.orchestrator:
+            pos_val = observation.get("position")
+            if pos_val is None or (isinstance(pos_val, (list, tuple)) and len(pos_val) == 3):
+                try:
+                    context["v2_curriculum"] = self.orchestrator.observe_turn_transition(observation)
+                except Exception as exc:
+                    LOG.debug("V2 curriculum turn transition skipped: %s", exc)
         return context
 
     def messages(self, observation, correction="", role="actor"):
@@ -1795,6 +1850,7 @@ class Brain:
             if isinstance(b, dict) and isinstance(b.get("id"), str)
             and b["id"].endswith(("_log", "_stem"))
             and isinstance(b.get("at"), list) and len(b["at"]) == 3
+            and b.get("reachable", True)
             and not blocked(observation, "mine", b["id"])
         ]
         here = observation.get("position")
@@ -1830,6 +1886,7 @@ class Brain:
             b for b in observation.get("nearby_blocks", [])
             if isinstance(b, dict) and b.get("id") in ("minecraft:stone", "minecraft:cobblestone")
             and isinstance(b.get("at"), list) and len(b["at"]) == 3
+            and b.get("reachable", True)
             and not blocked(observation, "mine", b["id"])
         ]
         goto_near_stone = (

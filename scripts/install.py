@@ -14,7 +14,7 @@ def main():
     parser.add_argument("--minecraft", type=Path, default=Path.home() / ".minecraft")
     args = parser.parse_args()
     dependencies()
-    jar = ROOT / "build/libs/minecraft-local-ai-0.1.0.jar"
+    jar = ROOT / "build/libs/minecraft-local-ai-0.2.0.jar"
     if not jar.is_file():
         raise SystemExit("Build first: bash scripts/build.sh")
     mods = args.minecraft / "mods"

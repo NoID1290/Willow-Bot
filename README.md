@@ -438,6 +438,20 @@ by Ollama). `benchmarks/qwen3.5-9b-8k.json` records the new configuration.
 - **Mining completion** is detected when the targeted block is gone or replaced
   (water, falling gravel), not only when air appears, so underwater or
   waterlogged mining no longer waits for the 120-second timeout.
+- **Reachability and digging down.** Every `nearby_blocks` entry carries
+  `reachable`: whether some safe standing cell within arm's reach exists (a lake
+  bed or a block behind a wall is not). Unreachable blocks are excluded from mine
+  targets instead of failing with "No reachable matching block". When a pickaxe
+  is owned, no stone is reachable and Willow stands on dry ground, `crafting.next_step`
+  becomes `tunnel` with a heading four blocks below: `tunnel` toward a lower `y`
+  digs a one-block-per-step staircase (head, feet, step below, then walk down),
+  and the foundation routine follows it without a model call. `tunnel` is always
+  available to pickaxe owners.
+- **No random walks.** Undirected `explore`/`wait` steps are stripped from
+  follow-up plans (each needs a fresh look), and a generated skill that returns
+  `explore`/`wait` for every dry-run observation (`return explore()` with no
+  guard) is rejected. A waypoint name re-saved without a player request moves at
+  most every three minutes.
 
 MoE active-parameter counts are not total memory requirements. Official Ollama
 manifests list approximately **18.62 GB** of weights for

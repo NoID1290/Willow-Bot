@@ -2,7 +2,7 @@ plugins {
     id 'net.fabricmc.fabric-loom' version '1.17.21'
 }
 
-version = '0.1.0'
+version = '0.2.0'
 group = 'local.minecraft.ai'
 
 repositories {
@@ -59,7 +59,12 @@ tasks.withType(JavaCompile).configureEach {
 
 processResources {
     from('brain') {
-        include 'server.py', 'skills.py', 'experience.py', 'modelprofile.py', 'monitor.py', 'memory.py', 'multimodal.py'
+        include 'server.py', 'experience.py', 'modelprofile.py', 'monitor.py', 'memory.py', 'multimodal.py', 'orchestrator.py'
+        include 'hardware_opt/*.py'
+        include 'rl_rewards/*.py'
+        include 'curriculum/*.py', 'curriculum/*.json'
+        include 'execution/*.py'
+        include 'skills/*.py'
         into 'localai/brain'
     }
     inputs.property 'version', project.version

@@ -209,15 +209,18 @@ class Memory:
             return False
         now = time.time()
         dimension = str(observation.get("dimension", "unknown"))
-        existing = self.db.execute("SELECT dimension,x,y,z FROM waypoints WHERE name=?", (name,)).fetchone()
+        existing = self.db.execute("SELECT dimension,x,y,z,updated FROM waypoints WHERE name=?", (name,)).fetchone()
         if existing:
-            if list(existing) == [dimension, *here]:
+            if list(existing[:4]) == [dimension, *here]:
                 return False
             chat = " ".join(observation.get("chat", [])).lower()
             chat_requests_waypoint = any(w in chat for w in ("waypoint", "home", "base", "set", "save", name.lower()))
-            if (existing[0] == dimension and not chat_requests_waypoint
-                    and max(abs(existing[1] - here[0]), abs(existing[2] - here[1]), abs(existing[3] - here[2])) < 8):
-                return False
+            if existing[0] == dimension and not chat_requests_waypoint:
+                if max(abs(existing[1] - here[0]), abs(existing[2] - here[1]), abs(existing[3] - here[2])) < 8:
+                    return False
+                # Models tend to re-save the same name every decision; a named place should not drift that fast.
+                if now - float(existing[4] or 0) < 180:
+                    return False
         self.db.execute("""
             INSERT INTO waypoints VALUES (?,?,?,?,?,?,?,?)
             ON CONFLICT(name) DO UPDATE SET dimension=excluded.dimension, x=excluded.x, y=excluded.y,

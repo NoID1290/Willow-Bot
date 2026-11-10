@@ -18,9 +18,102 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.AABB;
 
 final class Navigator {
+    static final long MAX_TIME_SLICE_NANOS = 2_500_000L; // Strict 2.5ms per game tick budget
     private record Node(BlockPos pos, int cost, int score) {}
+
+    private static final class TimeSlicedSearch {
+        final ServerLevel level;
+        final BlockPos start;
+        final BlockPos goal;
+        final int maxDrop;
+        final boolean startInWater;
+        final PriorityQueue<Node> open = new PriorityQueue<>(Comparator.comparingInt(Node::score));
+        final Map<BlockPos, Integer> costs = new HashMap<>();
+        final Map<BlockPos, BlockPos> parents = new HashMap<>();
+        final Map<BlockPos, Double> heights = new HashMap<>();
+        int remainingBudget = 3000;
+        boolean finished = false;
+        List<BlockPos> result = List.of();
+
+        TimeSlicedSearch(ServerLevel level, BlockPos start, BlockPos goal, int maxDrop) {
+            this.level = level;
+            this.start = start;
+            this.goal = goal;
+            this.maxDrop = maxDrop;
+            if (goal != null && (start.distManhattan(goal) > 48 || !safe(level, goal))) {
+                this.finished = true;
+                this.startInWater = false;
+                return;
+            }
+            this.startInWater = !Double.isFinite(standingY(level, start))
+                    && (level.getBlockState(start).is(Blocks.LAVA) ? false
+                    : (level.getBlockState(start).is(Blocks.WATER) || level.getBlockState(start.below()).is(Blocks.WATER)));
+            double initialY = standingY(level, start);
+            if (!Double.isFinite(initialY) && (startInWater || goal != null)) {
+                initialY = start.getY();
+            }
+            heights.put(start, initialY);
+            costs.put(start, 0);
+            open.add(new Node(start, 0, goal == null ? 0 : start.distManhattan(goal)));
+        }
+
+        boolean advanceSlice(long maxNanos) {
+            if (finished) return true;
+            long deadline = System.nanoTime() + maxNanos;
+            while (!open.isEmpty() && remainingBudget-- > 0) {
+                if (System.nanoTime() >= deadline) {
+                    return false; // Yield to next server tick to protect 50ms tick stability
+                }
+                Node current = open.remove();
+                if (current.cost() != costs.getOrDefault(current.pos(), Integer.MAX_VALUE)) continue;
+                if (goal == null ? current.pos().getY() <= start.getY() - 2 : current.pos().equals(goal)) {
+                    List<BlockPos> built = new ArrayList<>();
+                    BlockPos cursor = current.pos();
+                    while (!cursor.equals(start)) {
+                        built.add(cursor);
+                        cursor = parents.get(cursor);
+                    }
+                    Collections.reverse(built);
+                    this.result = built;
+                    this.finished = true;
+                    return true;
+                }
+                double fromY = heights.computeIfAbsent(current.pos(),
+                        pos -> startInWater ? waterEscapeY(level, pos) : standingY(level, pos));
+                if (!Double.isFinite(fromY)) continue;
+                for (int[] direction : new int[][]{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) {
+                    for (int dy = 1; dy >= -maxDrop; dy--) {
+                        BlockPos next = current.pos().offset(direction[0], dy, direction[1]);
+                        int radius = goal == null ? 6 : 24;
+                        if (Math.abs(next.getX() - start.getX()) > radius
+                                || Math.abs(next.getZ() - start.getZ()) > radius) continue;
+                        double nextY = heights.computeIfAbsent(next,
+                                pos -> startInWater ? waterEscapeY(level, pos) : standingY(level, pos));
+                        if (!Double.isFinite(nextY)
+                                || nextY - fromY > 1.001 || fromY - nextY > maxDrop + 0.001) continue;
+                        if (!clearAt(level, current.pos(), Math.max(fromY, nextY))
+                                || !clearAt(level, next, Math.max(fromY, nextY))) continue;
+                        if (nextY < fromY && !level.noBlockCollision(null,
+                                new AABB(next.getX() + 0.2, nextY + 0.001, next.getZ() + 0.2,
+                                        next.getX() + 0.8, fromY + 1.8, next.getZ() + 0.8))) continue;
+                        int waterPenalty = (startInWater && !safe(level, next)) ? 4 : 0;
+                        int cost = current.cost() + 1 + Math.abs(dy) + waterPenalty;
+                        if (cost < costs.getOrDefault(next, Integer.MAX_VALUE)) {
+                            costs.put(next, cost);
+                            parents.put(next, current.pos());
+                            open.add(new Node(next, cost, cost + (goal == null ? 0 : next.distManhattan(goal))));
+                        }
+                    }
+                }
+            }
+            this.finished = true;
+            return true;
+        }
+    }
+
     private final ServerPlayer player;
     private List<BlockPos> path = List.of();
+    private TimeSlicedSearch pendingSearch;
     private int index;
     private int stuck;
     private Vec3 previous;
@@ -163,8 +256,15 @@ final class Navigator {
         stuck = 0;
         sprinting = false;
         previous = player.position();
-        path = find(player.level(), player.blockPosition(), null, 12);
-        return !path.isEmpty();
+        pendingSearch = null;
+        TimeSlicedSearch search = new TimeSlicedSearch(player.level(), player.blockPosition(), null, 12);
+        if (search.advanceSlice(MAX_TIME_SLICE_NANOS)) {
+            path = search.result;
+            return !path.isEmpty();
+        }
+        pendingSearch = search;
+        path = List.of();
+        return true;
     }
 
     boolean go(BlockPos destination, int maxDrop) {
@@ -172,12 +272,34 @@ final class Navigator {
         stuck = 0;
         sprinting = false;
         previous = player.position();
-        path = find(player.level(), player.blockPosition(), destination, maxDrop);
-        return !path.isEmpty() || (player.blockPosition().equals(destination) && safe(player.level(), destination));
+        pendingSearch = null;
+        if (player.blockPosition().equals(destination) && safe(player.level(), destination)) {
+            path = List.of();
+            return true;
+        }
+        TimeSlicedSearch search = new TimeSlicedSearch(player.level(), player.blockPosition(), destination, maxDrop);
+        if (search.advanceSlice(MAX_TIME_SLICE_NANOS)) {
+            path = search.result;
+            return !path.isEmpty();
+        }
+        pendingSearch = search;
+        path = List.of();
+        return true;
     }
 
     boolean tick() {
         EntityPlayerActionPack pack = ((ServerPlayerInterface) player).getActionPack();
+        if (pendingSearch != null) {
+            if (!pendingSearch.advanceSlice(MAX_TIME_SLICE_NANOS)) {
+                return false;
+            }
+            path = pendingSearch.result;
+            pendingSearch = null;
+            if (path.isEmpty()) {
+                pack.setSprinting(false);
+                throw new IllegalArgumentException("No safe path found within search budget");
+            }
+        }
         if (index >= path.size()) {
             pack.setSprinting(false);
             pack.stopMovement();

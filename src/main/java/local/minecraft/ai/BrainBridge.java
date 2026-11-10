@@ -42,12 +42,48 @@ final class BrainBridge implements AutoCloseable {
         this.settings = settings;
     }
 
+    private static final String[] BRAIN_RESOURCES = new String[]{
+            "server.py",
+            "experience.py",
+            "modelprofile.py",
+            "monitor.py",
+            "memory.py",
+            "multimodal.py",
+            "orchestrator.py",
+            "hardware_opt/__init__.py",
+            "hardware_opt/llm_client.py",
+            "hardware_opt/telemetry_formatter.py",
+            "hardware_opt/memory_pool.py",
+            "rl_rewards/__init__.py",
+            "rl_rewards/telemetry_snapshot.py",
+            "rl_rewards/reward_calculator.py",
+            "rl_rewards/q_table.py",
+            "rl_rewards/reflexion_log.py",
+            "curriculum/__init__.py",
+            "curriculum/advancement_dag.json",
+            "curriculum/mechanics_registry.py",
+            "curriculum/curriculum_dag.py",
+            "curriculum/curriculum_manager.py",
+            "execution/__init__.py",
+            "execution/pathfinder.py",
+            "execution/bot_actions.py",
+            "execution/sandbox.py",
+            "skills/__init__.py",
+            "skills/legacy_skills.py",
+            "skills/skill_store.py",
+            "skills/critic.py",
+            "skills/code_agent.py"
+    };
+
     static void extractScripts(Path directory) throws IOException {
         Files.createDirectories(directory);
-        for (String name : new String[]{"server.py", "skills.py", "experience.py", "modelprofile.py", "monitor.py", "memory.py", "multimodal.py"}) {
+        Files.deleteIfExists(directory.resolve("skills.py"));
+        for (String name : BRAIN_RESOURCES) {
             try (var resource = BrainBridge.class.getResourceAsStream("/localai/brain/" + name)) {
                 if (resource == null) throw new IOException("Packaged brain/" + name + " missing");
-                Files.copy(resource, directory.resolve(name), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                Path target = directory.resolve(name);
+                Files.createDirectories(target.getParent());
+                Files.copy(resource, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             }
         }
     }

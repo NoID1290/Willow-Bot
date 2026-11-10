@@ -95,7 +95,15 @@ class MemoryTests(unittest.TestCase):
         moved = dict(self.observation, position=[20, 65, 10])
         self.act(moved, waypoint="home")
         events = [r[0] for r in self.brain.db.execute("SELECT text FROM events WHERE kind='waypoint'")]
+        self.assertEqual(events, ["Saved waypoint home at [10, 64, 10]"],
+                         "Re-saving a name seconds later must not let the place drift every decision")
+        self.brain.db.execute("UPDATE waypoints SET updated=updated-600 WHERE name='home'")
+        self.act(moved, waypoint="home")
+        events = [r[0] for r in self.brain.db.execute("SELECT text FROM events WHERE kind='waypoint'")]
         self.assertEqual(events, ["Saved waypoint home at [10, 64, 10]", "Saved waypoint home at [20, 65, 10]"])
+        # A player request moves it immediately.
+        self.act(dict(self.observation, chat=["save this as home"]), waypoint="home")
+        self.assertEqual(self.brain.db.execute("SELECT x,y,z FROM waypoints WHERE name='home'").fetchone(), (10, 64, 10))
 
     def test_invalid_waypoint_name_is_ignored(self):
         self.act(self.observation, waypoint="last_position")

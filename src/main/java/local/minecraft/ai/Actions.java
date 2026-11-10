@@ -56,6 +56,13 @@ final class Actions {
     private int miningRepositions;
     private List<BlockPos> watched = List.of();
     private final SightPerception sightPerception = new SightPerception();
+    private final LiveReflexState liveReflex = new LiveReflexState();
+    private final BlockPos.MutableBlockPos wsScanCursor = new BlockPos.MutableBlockPos();
+    private int improperToolMineAttempts = 0;
+    private int blocksMinedCount = 0;
+    private int pathfindingTimeouts = 0;
+    private final List<String> toolsBroken = new ArrayList<>();
+    private String trackedMainHandTool = "";
     private String currentGoal = "";
     private String lastSpeech = "";
 
@@ -536,11 +543,15 @@ final class Actions {
                     .filter(p -> BuiltInRegistries.BLOCK.getKey(player.level().getBlockState(p).getBlock())
                             .toString().equals(name)).toList();
         }
+        boolean missingRequiredTool = false;
         for (BlockPos candidate : candidates) {
             var state = player.level().getBlockState(candidate);
             if (state.getDestroySpeed(player.level(), candidate) < 0
                     || candidate.equals(player.blockPosition().below())) continue;
-            if (state.requiresCorrectToolForDrops() && !hasTool(candidate)) continue;
+            if (state.requiresCorrectToolForDrops() && !hasTool(candidate)) {
+                missingRequiredTool = true;
+                continue;
+            }
             target = candidate;
             if (visible(player, target)) return;
             try {
@@ -555,6 +566,9 @@ final class Actions {
                     }
                 }
             }
+        }
+        if (missingRequiredTool) {
+            improperToolMineAttempts++;
         }
         throw new IllegalArgumentException("No reachable matching block with a suitable tool");
     }
@@ -595,18 +609,59 @@ final class Actions {
         player.inventoryMenu.broadcastChanges();
     }
 
-    private boolean selectFood() {
+    void selectHotbarOrSwap(int slot) {
+        select(slot);
+    }
+
+    void equipBestWeapon() {
+        int bestSlot = -1;
+        int bestRank = -1;
         for (int i = 0; i < 36; i++) {
             ItemStack stack = player.getInventory().getItem(i);
-            String name = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
-            if (stack.has(DataComponents.FOOD) && !name.contains("rotten")
-                    && !name.contains("spider_eye") && !name.contains("pufferfish")
-                    && !name.contains("poisonous") && !name.contains("suspicious")) {
-                select(i);
-                return true;
+            if (stack.isEmpty()) continue;
+            String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).getPath();
+            int rank = -1;
+            if (id.equals("netherite_sword")) rank = 60;
+            else if (id.equals("diamond_sword")) rank = 50;
+            else if (id.equals("iron_sword")) rank = 40;
+            else if (id.equals("stone_sword")) rank = 30;
+            else if (id.equals("wooden_sword")) rank = 20;
+            else if (id.endsWith("_axe")) rank = 15;
+            if (rank > bestRank) {
+                bestRank = rank;
+                bestSlot = i;
             }
         }
+        if (bestSlot >= 0) select(bestSlot);
+    }
+
+    boolean selectHighestSaturationFood() {
+        int bestSlot = -1;
+        float bestScore = -1.0f;
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = player.getInventory().getItem(i);
+            if (stack.isEmpty()) continue;
+            String name = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+            var food = stack.get(DataComponents.FOOD);
+            if (food != null && !name.contains("rotten")
+                    && !name.contains("spider_eye") && !name.contains("pufferfish")
+                    && !name.contains("poisonous") && !name.contains("suspicious")) {
+                float score = food.saturation() * 2.0f + food.nutrition();
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestSlot = i;
+                }
+            }
+        }
+        if (bestSlot >= 0) {
+            select(bestSlot);
+            return true;
+        }
         return false;
+    }
+
+    private boolean selectFood() {
+        return selectHighestSaturationFood();
     }
 
     private boolean canPlaceUnder(BlockPos pos) {
@@ -1002,21 +1057,30 @@ final class Actions {
 
     private void tunnelForward(BlockPos heading) {
         Direction dir = horizontalDirectionToward(heading);
+        BlockPos feetNow = player.blockPosition();
+        // A heading below the player digs a staircase: clear head, feet and the step below, then walk down.
+        boolean descend = heading != null && !heading.equals(BlockPos.ZERO) && heading.getY() < feetNow.getY();
+        if (descend) {
+            BlockPos ahead = feetNow.relative(dir);
+            for (BlockPos candidate : List.of(ahead.above(), ahead, ahead.below())) {
+                if (digCandidate(candidate)) return;
+            }
+            if (navigator.go(ahead.below())) {
+                walking = true;
+                action = "goto";
+                recoveryMethod = "Stepping down the dug staircase";
+                return;
+            }
+            throw new IllegalArgumentException("Staircase step below is not safe to stand on (cave, water or lava); choose another heading");
+        }
         for (int step = 1; step <= 2; step++) {
-            BlockPos feet = player.blockPosition().relative(dir, step);
+            BlockPos feet = feetNow.relative(dir, step);
             BlockPos head = feet.above();
             for (BlockPos candidate : List.of(head, feet)) {
-                var state = player.level().getBlockState(candidate);
-                if (!state.isAir() && state.getFluidState().isEmpty() && state.getDestroySpeed(player.level(), candidate) >= 0) {
-                    if (state.requiresCorrectToolForDrops() && !hasTool(candidate)) continue;
-                    target = candidate;
-                    targetName = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
-                    action = "mine";
-                    return;
-                }
+                if (digCandidate(candidate)) return;
             }
         }
-        BlockPos stepAhead = player.blockPosition().relative(dir);
+        BlockPos stepAhead = feetNow.relative(dir);
         if (navigator.go(stepAhead)) {
             walking = true;
             action = "goto";
@@ -1024,6 +1088,16 @@ final class Actions {
             return;
         }
         throw new IllegalArgumentException("No diggable 1x2 tunnel block ahead in direction " + dir.getName());
+    }
+
+    private boolean digCandidate(BlockPos candidate) {
+        var state = player.level().getBlockState(candidate);
+        if (state.isAir() || !state.getFluidState().isEmpty() || state.getDestroySpeed(player.level(), candidate) < 0) return false;
+        if (state.requiresCorrectToolForDrops() && !hasTool(candidate)) return false;
+        target = candidate;
+        targetName = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+        action = "mine";
+        return true;
     }
 
     private void bridgeForward(BlockPos heading) {
@@ -1310,28 +1384,25 @@ final class Actions {
         }
     }
 
+    boolean reflex20Hz() {
+        return liveReflex.tick20Hz(player, this);
+    }
+
+    boolean isCombatOrFleeActive() {
+        return liveReflex.isCombatOrFleeActive();
+    }
+
     boolean reflex() {
-        if (player.isUsingItem()) return false;
-        if (player.getFoodData().getFoodLevel() < 14 && selectFood()) {
-            stop("Interrupted to eat before hunger becomes dangerous");
-            player.getMainHandItem().use(player.level(), player, InteractionHand.MAIN_HAND);
-            if (player.isUsingItem()) return true;
-        }
-        if (player.isInWater() || player.isInLava()) {
-            pack().start(EntityPlayerActionPack.ActionType.JUMP, EntityPlayerActionPack.Action.once());
-        }
-        for (Entity entity : nearbyEntities()) {
-            if (entity instanceof Monster && player.distanceToSqr(entity) < 8
-                    && player.hasLineOfSight(entity) && player.getAttackStrengthScale(0) >= 0.95) {
-                player.attack(entity);
-                player.swing(InteractionHand.MAIN_HAND, net.minecraft.world.item.component.SwingAnimation.DEFAULT, true);
-                break;
-            }
-        }
-        return false;
+        return reflex20Hz();
     }
 
     private void finish(boolean success, String detail) {
+        if (!success && detail != null && (detail.contains("timed out") || detail.contains("stuck") || detail.contains("No safe"))) {
+            pathfindingTimeouts++;
+        }
+        if (success && "mine".equals(action)) {
+            blocksMinedCount++;
+        }
         finish(success ? "success" : "failed", detail);
     }
 
@@ -1378,6 +1449,22 @@ final class Actions {
                 || id.equals("minecraft:seagrass") || id.equals("minecraft:tall_seagrass");
     }
 
+    /** Whether some safe standing cell within arm's reach of the block exists (no path search, no raycast). */
+    private boolean reachable(BlockPos block) {
+        BlockPos feet = player.blockPosition();
+        if (player.getEyePosition().distanceToSqr(Vec3.atCenterOf(block)) <= 20.25 && !block.equals(feet.below())) return true;
+        for (int dy = -2; dy <= 1; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    BlockPos stand = block.offset(dx, dy, dz);
+                    if (stand.equals(block) || stand.above().equals(block) || stand.below().equals(block)) continue;
+                    if (Navigator.safe(player.level(), stand)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     List<BlockPos> nearbyBlocks() {
         List<BlockPos> blocks = new ArrayList<>();
         BlockPos center = player.blockPosition();
@@ -1417,8 +1504,18 @@ final class Actions {
         pos.add(player.blockPosition().getZ());
         observation.add("position", pos);
         observation.addProperty("dimension", player.level().dimension().identifier().toString());
+        observation.addProperty("world_tick", player.level().getGameTime());
         observation.addProperty("health", player.getHealth());
+        observation.addProperty("max_health", player.getMaxHealth());
+        observation.addProperty("absorption", player.getAbsorptionAmount());
         observation.addProperty("food", player.getFoodData().getFoodLevel());
+        observation.addProperty("saturation", player.getFoodData().getSaturationLevel());
+        observation.addProperty("armor_points", player.getArmorValue());
+        observation.addProperty("is_alive", player.isAlive());
+        observation.addProperty("fire_ticks", player.getRemainingFireTicks());
+        observation.addProperty("fall_distance", player.fallDistance);
+        observation.addProperty("in_lava", player.isInLava());
+        observation.addProperty("suffocating", player.isInWall());
         observation.addProperty("on_ground", player.onGround());
         observation.addProperty("in_water", player.isInWater());
         observation.addProperty("air", player.getAirSupply());
@@ -1503,14 +1600,22 @@ final class Actions {
             if (state.is(Blocks.COAL_ORE) || state.is(Blocks.IRON_ORE) || state.is(Blocks.STONE)) return 2;
             return 3;
         }));
+        boolean reachableStone = false;
         for (BlockPos block : nearby) {
-            String name = BuiltInRegistries.BLOCK.getKey(player.level().getBlockState(block).getBlock()).toString();
+            var blockState = player.level().getBlockState(block);
+            String name = BuiltInRegistries.BLOCK.getKey(blockState.getBlock()).toString();
             if (seen.merge(name, 1, Integer::sum) > 3) continue;
+            boolean canReach = reachable(block);
+            if (canReach && (blockState.is(Blocks.STONE) || blockState.is(Blocks.COBBLESTONE) || blockState.is(Blocks.DEEPSLATE))
+                    && (!blockState.requiresCorrectToolForDrops() || hasTool(block))) {
+                reachableStone = true;
+            }
             JsonObject resource = new JsonObject();
             resource.addProperty("id", name);
             resource.addProperty("visible", visible(player, block));
-            resource.addProperty("requires_tool", player.level().getBlockState(block).requiresCorrectToolForDrops());
-            resource.addProperty("has_tool", !player.level().getBlockState(block).requiresCorrectToolForDrops() || hasTool(block));
+            resource.addProperty("reachable", canReach);
+            resource.addProperty("requires_tool", blockState.requiresCorrectToolForDrops());
+            resource.addProperty("has_tool", !blockState.requiresCorrectToolForDrops() || hasTool(block));
             JsonArray location = new JsonArray();
             location.add(block.getX());
             location.add(block.getY());
@@ -1550,7 +1655,23 @@ final class Actions {
         JsonArray trades = new JsonArray();
         availableTrades().forEach(trades::add);
         observation.add("trades", trades);
-        observation.add("crafting", Crafting.awareness(player, plans, placementSites()));
+        JsonObject crafting = Crafting.awareness(player, plans, placementSites());
+        if (!crafting.has("next_step") && !reachableStone && player.onGround() && !player.isInWater()
+                && crafting.get("pickaxes").getAsInt() > 0 && crafting.get("stone_pickaxes").getAsInt() == 0
+                && player.getInventory().countItem(net.minecraft.world.item.Items.IRON_PICKAXE) == 0
+                && crafting.get("cobblestone").getAsInt() < 3) {
+            // Plains/lakes rarely expose stone; a staircase a few blocks down always reaches it.
+            BlockPos feet = player.blockPosition();
+            JsonObject step = new JsonObject();
+            step.addProperty("action", "tunnel");
+            step.addProperty("target", "");
+            step.addProperty("x", feet.getX());
+            step.addProperty("y", feet.getY() - 4);
+            step.addProperty("z", feet.getZ());
+            crafting.add("next_step", step);
+            crafting.addProperty("missing", "No reachable stone in sight; dig a staircase down with tunnel (heading below you) until stone is exposed, then mine 3 cobblestone.");
+        }
+        observation.add("crafting", crafting);
         observation.add("last_result", result());
         JsonArray remembered = new JsonArray();
         for (BlockPos watchedPos : watched) {
@@ -1571,6 +1692,141 @@ final class Actions {
         observation.add("doing", doing());
         observation.add("sight", sightPerception.observe(player));
         observation.add("hearing", AcousticSensor.summary(player.level().getGameTime()));
+        observation.add("equipment", captureEquipment());
+        observation.add("unlocked_advancements", captureUnlockedAdvancements());
+        observation.add("nearby_workstations", captureNearbyWorkstations());
+        observation.add("execution_telemetry", captureAndResetExecutionTelemetry());
         return observation;
+    }
+
+    private JsonObject captureEquipment() {
+        JsonObject eq = new JsonObject();
+        record SlotEntry(String label, net.minecraft.world.entity.EquipmentSlot slot) {}
+        for (SlotEntry se : new SlotEntry[]{
+                new SlotEntry("MainHand", net.minecraft.world.entity.EquipmentSlot.MAINHAND),
+                new SlotEntry("OffHand", net.minecraft.world.entity.EquipmentSlot.OFFHAND),
+                new SlotEntry("Head", net.minecraft.world.entity.EquipmentSlot.HEAD),
+                new SlotEntry("Chest", net.minecraft.world.entity.EquipmentSlot.CHEST),
+                new SlotEntry("Legs", net.minecraft.world.entity.EquipmentSlot.LEGS),
+                new SlotEntry("Feet", net.minecraft.world.entity.EquipmentSlot.FEET)}) {
+            ItemStack stack = player.getItemBySlot(se.slot());
+            JsonObject itemObj = new JsonObject();
+            if (stack.isEmpty()) {
+                itemObj.addProperty("item_id", "minecraft:air");
+                itemObj.addProperty("current_durability", 0);
+                itemObj.addProperty("max_durability", 0);
+            } else {
+                String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+                int maxDur = stack.getMaxDamage();
+                int curDur = maxDur > 0 ? Math.max(0, maxDur - stack.getDamageValue()) : 0;
+                itemObj.addProperty("item_id", id);
+                itemObj.addProperty("current_durability", curDur);
+                itemObj.addProperty("max_durability", maxDur);
+            }
+            eq.add(se.label(), itemObj);
+        }
+        ItemStack mh = player.getMainHandItem();
+        if (mh.isEmpty() && !trackedMainHandTool.isEmpty()) {
+            boolean stillOwned = false;
+            for (int i = 0; i < 36; i++) {
+                ItemStack s = player.getInventory().getItem(i);
+                if (!s.isEmpty() && BuiltInRegistries.ITEM.getKey(s.getItem()).toString().equals(trackedMainHandTool)) {
+                    stillOwned = true;
+                    break;
+                }
+            }
+            if (!stillOwned && toolsBroken.size() < 8) {
+                toolsBroken.add(trackedMainHandTool);
+            }
+            trackedMainHandTool = "";
+        } else if (!mh.isEmpty() && mh.getMaxDamage() > 0) {
+            trackedMainHandTool = BuiltInRegistries.ITEM.getKey(mh.getItem()).toString();
+        }
+        return eq;
+    }
+
+    private JsonArray captureUnlockedAdvancements() {
+        JsonArray unlocked = new JsonArray();
+        var server = player.level().getServer();
+        if (server == null) return unlocked;
+        var playerAdv = player.getAdvancements();
+        for (var holder : server.getAdvancements().getAllAdvancements()) {
+            String id = holder.id().toString();
+            if (id.contains(":recipes/")) continue;
+            if (playerAdv.getOrStartProgress(holder).isDone()) {
+                unlocked.add(id);
+            }
+        }
+        return unlocked;
+    }
+
+    private JsonObject captureNearbyWorkstations() {
+        JsonObject stations = new JsonObject();
+        BlockPos origin = player.blockPosition();
+        int ox = origin.getX();
+        int oy = origin.getY();
+        int oz = origin.getZ();
+        double bestTable = Double.MAX_VALUE;
+        double bestFurnace = Double.MAX_VALUE;
+        double bestChest = Double.MAX_VALUE;
+        double bestBed = Double.MAX_VALUE;
+        double bestPortal = Double.MAX_VALUE;
+
+        for (int dx = -16; dx <= 16; dx++) {
+            for (int dz = -16; dz <= 16; dz++) {
+                for (int dy = -4; dy <= 4; dy++) {
+                    wsScanCursor.set(ox + dx, oy + dy, oz + dz);
+                    if (!player.level().isLoaded(wsScanCursor)) continue;
+                    var s = player.level().getBlockState(wsScanCursor);
+                    if (s.isAir()) continue;
+                    double dSq = dx * dx + dy * dy + dz * dz;
+                    if (s.is(Blocks.CRAFTING_TABLE) && dSq < bestTable) {
+                        bestTable = dSq;
+                        stations.add("crafting_table", posJson(wsScanCursor));
+                    } else if ((s.is(Blocks.FURNACE) || s.is(Blocks.BLAST_FURNACE) || s.is(Blocks.SMOKER)) && dSq < bestFurnace) {
+                        bestFurnace = dSq;
+                        stations.add("furnace", posJson(wsScanCursor));
+                    } else if ((s.is(Blocks.CHEST) || s.is(Blocks.TRAPPED_CHEST) || s.is(Blocks.BARREL)) && dSq < bestChest) {
+                        bestChest = dSq;
+                        stations.add("chest", posJson(wsScanCursor));
+                    } else if (s.is(BlockTags.BEDS) && dSq < bestBed) {
+                        bestBed = dSq;
+                        stations.add("bed", posJson(wsScanCursor));
+                    } else if (s.is(Blocks.NETHER_PORTAL) && dSq < bestPortal) {
+                        bestPortal = dSq;
+                        stations.add("nether_portal", posJson(wsScanCursor));
+                    }
+                }
+            }
+        }
+        return stations;
+    }
+
+    private static JsonArray posJson(BlockPos p) {
+        JsonArray arr = new JsonArray();
+        arr.add(p.getX());
+        arr.add(p.getY());
+        arr.add(p.getZ());
+        return arr;
+    }
+
+    private JsonObject captureAndResetExecutionTelemetry() {
+        JsonObject exec = new JsonObject();
+        int durTicks = result.has("duration_ticks") ? result.get("duration_ticks").getAsInt() : ticks;
+        exec.addProperty("duration_ms", durTicks * 50L);
+        exec.addProperty("compilation_failed", false);
+        exec.add("runtime_exceptions", new JsonArray());
+        exec.addProperty("pathfinding_timeouts", pathfindingTimeouts);
+        exec.addProperty("blocks_mined_count", blocksMinedCount);
+        exec.addProperty("improper_tool_mine_attempts", improperToolMineAttempts);
+        JsonArray broken = new JsonArray();
+        toolsBroken.forEach(broken::add);
+        exec.add("tools_broken", broken);
+
+        pathfindingTimeouts = 0;
+        blocksMinedCount = 0;
+        improperToolMineAttempts = 0;
+        toolsBroken.clear();
+        return exec;
     }
 }

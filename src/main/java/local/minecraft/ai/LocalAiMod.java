@@ -618,9 +618,14 @@ public final class LocalAiMod implements ModInitializer {
                 actions.restoreResult(deathResult);
                 nextThink = server.getTickCount() + 60L;
             }
-            if (server.getTickCount() % 10 == 0 && actions.reflex()) discardPending = pending != null;
+            // 20 Hz Fast Reactive Survival Reflex Loop (runs every 50ms server tick; 0% GPU/LLM usage)
+            if (actions.reflex20Hz()) {
+                discardPending = pending != null;
+            }
             actions.tick();
             if (player.isUsingItem() && !actions.busy()) return;
+            // Pause new LLM inference dispatches while Reflex Loop is actively fighting or fleeing
+            if (actions.isCombatOrFleeActive() && pending == null) return;
             if (pending != null) {
                 if (!pending.isDone()) return;
                 CompletableFuture<JsonObject> completed = pending;

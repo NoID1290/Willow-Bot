@@ -50,6 +50,44 @@ class StockpileTests(unittest.TestCase):
         self.assertIn("minecraft:stone", action_targets(obs, "mine"))
         validate_action(decision(action="mine", target="minecraft:stone", x=1, y=64, z=0), obs)
 
+    def test_cave_wall_is_not_a_stockpile_loophole_when_she_can_walk_out(self):
+        # Cave log: 195 building blocks, stone walls on two sides, an open passage on the third.
+        obs = observation(FULL, position=[5, 60, -37], terrain={"exits": [
+            {"feet": "minecraft:stone", "head": "minecraft:stone", "at": [5, 60, -38], "standable": False},
+            {"feet": "minecraft:stone", "head": "minecraft:stone", "at": [6, 60, -37], "standable": False},
+            {"feet": "minecraft:air", "head": "minecraft:air", "at": [4, 60, -37], "standable": True}]})
+        self.assertEqual(action_targets(obs, "mine"), ["minecraft:coal_ore"])
+        for at in ((5, 59, -38), (5, 60, -38), (0, 0, 0)):
+            with self.subTest(at=at), self.assertRaisesRegex(ValueError, "that is enough"):
+                validate_action(decision(action="mine", target="minecraft:stone", x=at[0], y=at[1], z=at[2]), obs)
+
+    def test_enclosed_mine_is_redirected_to_the_wall_instead_of_rejected(self):
+        obs = observation(FULL, position=[5, 60, -37], terrain={"exits": [
+            {"feet": "minecraft:stone", "head": "minecraft:stone", "at": [5, 60, -38], "standable": False},
+            {"feet": "minecraft:air", "head": "minecraft:stone", "at": [6, 60, -37], "standable": False}]})
+        self.assertIn("minecraft:stone", action_targets(obs, "mine"))
+        # The floor block under the crosshair becomes the wall in the same direction.
+        floor = validate_action(decision(action="mine", target="minecraft:stone", x=5, y=59, z=-38), obs)
+        self.assertEqual([floor["x"], floor["y"], floor["z"]], [5, 60, -38])
+        # An overhanging head block is dug one above the exit cell.
+        head = validate_action(decision(action="mine", target="minecraft:stone", x=6, y=59, z=-37), obs)
+        self.assertEqual([head["x"], head["y"], head["z"]], [6, 61, -37])
+        # Automatic selection would pick the floor; it is pinned to the first wall instead.
+        auto = validate_action(decision(action="mine", target="minecraft:stone"), obs)
+        self.assertEqual([auto["x"], auto["y"], auto["z"]], [5, 60, -38])
+        # Coal is never redirected.
+        coal = validate_action(decision(action="mine", target="minecraft:coal_ore", x=2, y=64, z=0), obs)
+        self.assertEqual([coal["x"], coal["y"], coal["z"]], [2, 64, 0])
+
+    def test_newlines_in_free_text_do_not_discard_a_valid_action(self):
+        obs = observation(["minecraft:cobblestone=10"], free_slots=20)
+        value = validate_action(decision(action="mine", target="minecraft:stone", goal="Mine.\nPlan:\n1. pickup",
+                                         say="a\tb", memory="x\r\ny", waypoint="w\n"), obs)
+        self.assertEqual(value["goal"], "Mine. Plan: 1. pickup")
+        self.assertEqual((value["say"], value["memory"], value["waypoint"]), ("a b", "x y", "w"))
+        with self.assertRaisesRegex(ValueError, "Control character in target"):
+            validate_action(decision(action="mine", target="minecraft:st\none"), obs)
+
 
 class SkillLanguageTests(unittest.TestCase):
     def test_fake_item_ids_are_rejected_with_fix(self):

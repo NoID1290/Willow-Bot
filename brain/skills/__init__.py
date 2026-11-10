@@ -1,0 +1,70 @@
+"""Unified skills package: re-exports legacy interpreter APIs + Willow-Bot V2 Voyager RAG Store & Critic."""
+
+from .code_agent import STATIC_SYSTEM_PREFIX, SYNTHESIS_JSON_SCHEMA, CodeSkillAgent, SynthesizedSkillBundle
+from .critic import CriticEvaluation, FailureCategory, SelfVerificationCritic
+from .legacy_skills import (
+    ARITY,
+    EXAMPLE_SKILLS,
+    FAKE_IDS,
+    HELPERS,
+    HINTS,
+    SEED,
+    SkillLibrary,
+    _bm25_score,
+    _cosine_similarity,
+    _embedding_model,
+    _get_embedding,
+    dry_run,
+    extract_description,
+    interpret,
+    normalize,
+    parse,
+    rank_skills,
+    retrieve_few_shot_examples,
+)
+from .skill_store import (
+    BYTES_PER_VECTOR,
+    EMBEDDING_DIM,
+    CpuFeatureHasher,
+    RetrievedSkillMatch,
+    SkillRecord,
+    SkillStatus,
+    SkillStore,
+)
+
+__all__ = [
+    # Legacy interpreter exports (100% compatible with server.py and test_skills.py)
+    "ARITY",
+    "EXAMPLE_SKILLS",
+    "FAKE_IDS",
+    "HELPERS",
+    "HINTS",
+    "SEED",
+    "SkillLibrary",
+    "_bm25_score",
+    "_cosine_similarity",
+    "_embedding_model",
+    "_get_embedding",
+    "dry_run",
+    "extract_description",
+    "interpret",
+    "normalize",
+    "parse",
+    "rank_skills",
+    "retrieve_few_shot_examples",
+    # Willow-Bot V2 Module 4 exports
+    "BYTES_PER_VECTOR",
+    "CodeSkillAgent",
+    "CpuFeatureHasher",
+    "CriticEvaluation",
+    "EMBEDDING_DIM",
+    "FailureCategory",
+    "RetrievedSkillMatch",
+    "STATIC_SYSTEM_PREFIX",
+    "SYNTHESIS_JSON_SCHEMA",
+    "SelfVerificationCritic",
+    "SkillRecord",
+    "SkillStatus",
+    "SkillStore",
+    "SynthesizedSkillBundle",
+]
