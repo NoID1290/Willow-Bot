@@ -852,6 +852,8 @@ class Brain:
         self.settings = modelprofile.validate_settings(settings)
         self.profile = None
         self.profile_path = Path(database).parent / "model-profile.json"
+        self.status_path = None if str(database) == ":memory:" else Path(database).parent / "status.json"
+        self.started_at = time.time()
         self.db = sqlite3.connect(database)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript("""
@@ -1021,6 +1023,46 @@ class Brain:
             temporary.replace(self.profile_path)
         except OSError as exc:
             LOG.warning("Could not save model profile: %s", exc)
+
+    def _export_status(self, observation, decision, source, elapsed):
+        if not self.status_path:
+            return
+        milestones = observation.get("milestones") if isinstance(observation.get("milestones"), dict) else {}
+        diagnosis = observation.get("diagnosis") if isinstance(observation.get("diagnosis"), dict) else {}
+        curriculum = observation.get("v2_curriculum") if isinstance(observation.get("v2_curriculum"), dict) else {}
+        snapshot = {
+            "updated_at": time.time(),
+            "started_at": self.started_at,
+            "ollama": self.ollama,
+            "model": self.model,
+            "health": observation.get("health"),
+            "max_health": observation.get("max_health", 20),
+            "food": observation.get("food"),
+            "armor": observation.get("armor_points", 0),
+            "position": observation.get("position"),
+            "dimension": observation.get("dimension", ""),
+            "biome": observation.get("biome", ""),
+            "time": observation.get("time"),
+            "weather": observation.get("weather", "clear"),
+            "stuck": bool(diagnosis.get("stuck")),
+            "stuck_reason": str(diagnosis.get("reason") or ""),
+            "owned_tools": milestones.get("owned_tools") or {},
+            "free_slots": milestones.get("inventory_free_slots"),
+            "curriculum": curriculum,
+            "goal": decision.get("goal", ""),
+            "action": decision.get("action", ""),
+            "target": decision.get("target", ""),
+            "source": source,
+            "elapsed": round(float(elapsed), 2),
+            "plan_queued": len(self.steps),
+            "planner_status": self.planner_status,
+        }
+        try:
+            temporary = self.status_path.with_suffix(".tmp")
+            temporary.write_text(compact(snapshot), encoding="utf-8")
+            temporary.replace(self.status_path)
+        except OSError:
+            pass
 
     def autotune(self, run_benchmark=True):
         """Run hardware detection + live Ollama benchmark at startup, persist model-profile.json, and log all derived values."""
@@ -1953,6 +1995,7 @@ class Brain:
                 self.db.execute("INSERT INTO decisions VALUES (?,?,?,?,?,?,NULL)",
                                 (reflex_id, time.time(), reflex["action"], reflex["target"],
                                  reflex["goal"], reflex["memory"]))
+            self._export_status(observation, reflex, "reflex", 0.0)
             return reflex
         self.ensure_profile(timeout=self.actor_timeout)
         self.update_planner(observation)
@@ -2160,9 +2203,11 @@ class Brain:
         # Tells the mod whether rendering the PNG snapshot is worthwhile for this model/profile.
         decision["vision"] = bool((self.profile or {}).get("vision_enabled"))
         self.steps_last_id = decision_id
+        elapsed = time.monotonic() - started
         LOG.info("decision=%s action=%s target=%s source=%s elapsed=%.2fs",
                  decision_id, decision["action"], decision["target"],
-                 source, time.monotonic() - started)
+                 source, elapsed)
+        self._export_status(observation, decision, source, elapsed)
         self.schedule_planner(observation, messages)
         return decision
 
