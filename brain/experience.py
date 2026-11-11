@@ -22,8 +22,9 @@ def situation(observation):
 
 
 class Experience:
-    def __init__(self, db):
+    def __init__(self, db, q_table=None):
         self.db = db
+        self.q_table = q_table
         db.executescript("""
             CREATE TABLE IF NOT EXISTS decision_context
               (id TEXT PRIMARY KEY, situation TEXT, inventory TEXT, position TEXT);
@@ -73,6 +74,23 @@ class Experience:
         """, (now + 120, before[0], action, target))
         self.db.execute("DELETE FROM action_lookup WHERE rowid NOT IN "
                         "(SELECT rowid FROM action_lookup ORDER BY updated DESC LIMIT 10000)")
+
+        if self.q_table is not None and not success:
+            try:
+                target_str = target.split(":", 1)[-1] if target else ""
+                skill_id = f"{action}_{target_str}" if target_str else f"action_{action}"
+                ctx_hash = hash(before[0]) & 0xFFFFFFFF
+                self.q_table.update(
+                    context_prev=ctx_hash,
+                    task_prev=action,
+                    skill_id=skill_id,
+                    reward_total=-20.0,
+                    context_next=ctx_hash,
+                    task_next=action,
+                )
+            except Exception:
+                pass
+
         return delta
 
     def context(self, observation):
@@ -84,6 +102,18 @@ class Experience:
         lookup = [dict(action=r[0], target=r[1], attempts=r[2], successes=r[3], failures=r[4],
                        damage=r[5], last_detail=r[6], inventory_change=json.loads(r[7])) for r in rows]
         blocked = [dict(action=r[0], target=r[1], reason=r[6]) for r in rows if r[8] > time.time()]
+        if self.q_table is not None:
+            try:
+                ctx_hash = hash(key) & 0xFFFFFFFF
+                for item in lookup:
+                    t_str = item.get("target", "").split(":", 1)[-1] if item.get("target") else ""
+                    sid = f"{item['action']}_{t_str}" if t_str else f"action_{item['action']}"
+                    q_val = self.q_table.get_context_skill_q(ctx_hash, sid)
+                    if q_val <= -15.0:
+                        if not any(b["action"] == item["action"] and b.get("target") == item.get("target") for b in blocked):
+                            blocked.append(dict(action=item["action"], target=item.get("target", ""), reason=f"Low Q-value ({q_val:+.1f})"))
+            except Exception:
+                pass
         return lookup, blocked
 
     def changes(self, observation):

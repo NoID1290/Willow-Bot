@@ -23,6 +23,7 @@ import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.item.context.UseOnContext;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.Blocks;
@@ -40,6 +41,7 @@ final class Actions {
     private int entityId;
     private int ticks;
     private boolean walking;
+    private boolean sleeping;
     private boolean attackingBlock;
     private int foodBefore;
     private JsonObject result = new JsonObject();
@@ -57,7 +59,6 @@ final class Actions {
     private List<BlockPos> watched = List.of();
     private final SightPerception sightPerception = new SightPerception();
     private final LiveReflexState liveReflex = new LiveReflexState();
-    private final BlockPos.MutableBlockPos wsScanCursor = new BlockPos.MutableBlockPos();
     private int improperToolMineAttempts = 0;
     private int blocksMinedCount = 0;
     private int pathfindingTimeouts = 0;
@@ -176,6 +177,7 @@ final class Actions {
         escapeBlockBroken = false;
         recoveryTicks = 0;
         miningRepositions = 0;
+        sleeping = false;
         id = decision.get("id").getAsString();
         action = decision.get("action").getAsString();
         String name = decision.get("target").getAsString();
@@ -196,7 +198,7 @@ final class Actions {
                 case "wait" -> { }
                 case "jump" -> {
                     BlockPos heading = coordinatesOrZero(decision);
-                    if (!heading.equals(BlockPos.ZERO)) {
+                    if (heading != null) {
                         float yaw = (float) Math.toDegrees(Math.atan2(-(heading.getX() + 0.5 - player.getX()), heading.getZ() + 0.5 - player.getZ()));
                         pack().look(yaw, 0).setForward(1.0f);
                     }
@@ -207,7 +209,7 @@ final class Actions {
                         throw new IllegalArgumentException("Cannot sprint: food level is too low (" + player.getFoodData().getFoodLevel() + ")");
                     }
                     BlockPos dest = coordinatesOrZero(decision);
-                    if (!dest.equals(BlockPos.ZERO)) {
+                    if (dest != null) {
                         if (!navigator.sprintTo(dest)) throw new IllegalArgumentException("No safe running path to " + dest.toShortString());
                         walking = true;
                     } else {
@@ -217,7 +219,7 @@ final class Actions {
                 case "sneak", "crouch" -> pack().setSneaking(true);
                 case "pillar" -> {
                     BlockPos pos = coordinatesOrZero(decision);
-                    if (pos.equals(BlockPos.ZERO)) pos = player.blockPosition();
+                    if (pos == null) pos = player.blockPosition();
                     pillarUp(name, pos);
                 }
                 case "craft" -> finish(true, Crafting.craft(player, name));
@@ -243,13 +245,12 @@ final class Actions {
                 }
                 case "explore" -> {
                     BlockPos heading = headingOrZero(decision);
-                    explore(heading.equals(BlockPos.ZERO) ? null : heading);
+                    explore(heading);
                 }
                 case "escape" -> escape();
                 case "mine" -> {
-                    boolean automatic = decision.get("x").getAsInt() == 0 && decision.get("y").getAsInt() == 0
-                            && decision.get("z").getAsInt() == 0;
-                    mine(name, automatic ? null : coordinates(decision));
+                    BlockPos pos = coordinatesOrZero(decision);
+                    mine(name, pos);
                 }
                 case "place" -> place(name, coordinates(decision));
                 case "smelt" -> smelt(name);
@@ -296,26 +297,23 @@ final class Actions {
         }
     }
 
+    private boolean hasCoordinates(JsonObject decision) {
+        return decision != null && decision.has("x") && decision.has("y") && decision.has("z")
+                && !decision.get("x").isJsonNull() && !decision.get("y").isJsonNull() && !decision.get("z").isJsonNull();
+    }
+
     private BlockPos headingOrZero(JsonObject decision) {
-        if (!decision.has("x") || !decision.has("y") || !decision.has("z")) return BlockPos.ZERO;
-        int x = decision.get("x").getAsInt();
-        int y = decision.get("y").getAsInt();
-        int z = decision.get("z").getAsInt();
-        if (x == 0 && y == 0 && z == 0) return BlockPos.ZERO;
-        return new BlockPos(x, y, z);
+        if (!hasCoordinates(decision)) return null;
+        return new BlockPos(decision.get("x").getAsInt(), decision.get("y").getAsInt(), decision.get("z").getAsInt());
     }
 
     private BlockPos coordinatesOrZero(JsonObject decision) {
-        if (!decision.has("x") || !decision.has("y") || !decision.has("z")) return BlockPos.ZERO;
-        int x = decision.get("x").getAsInt();
-        int y = decision.get("y").getAsInt();
-        int z = decision.get("z").getAsInt();
-        if (x == 0 && y == 0 && z == 0) return BlockPos.ZERO;
-        BlockPos pos = new BlockPos(x, y, z);
+        if (!hasCoordinates(decision)) return null;
+        BlockPos pos = new BlockPos(decision.get("x").getAsInt(), decision.get("y").getAsInt(), decision.get("z").getAsInt());
         if (player.blockPosition().distManhattan(pos) > 48
                 || Math.abs(pos.getX() - player.getX()) > 24
                 || Math.abs(pos.getZ() - player.getZ()) > 24
-                || !player.level().isLoaded(pos)) return BlockPos.ZERO;
+                || !player.level().isLoaded(pos)) return null;
         return pos;
     }
 
@@ -828,9 +826,15 @@ final class Actions {
         }
         if (fuelSlot < 0) throw new IllegalArgumentException("No furnace fuel (coal, charcoal, planks, logs, sticks) in inventory");
         ItemStack inputStack = player.getInventory().getItem(inputSlot);
+        ItemStack fuelStack = player.getInventory().getItem(fuelSlot);
         ItemStack resultProto = Crafting.smeltResult(inputStack);
-        int batch = Math.min(inputStack.getCount(), 8);
+        boolean isLava = fuelStack.is(Items.LAVA_BUCKET);
+        int maxCapacity = Crafting.fuelCapacity(fuelStack);
+        int batch = Math.min(inputStack.getCount(), maxCapacity);
         player.getInventory().removeItem(fuelSlot, 1);
+        if (isLava) {
+            player.getInventory().placeItemBackInInventory(new ItemStack(Items.BUCKET), net.minecraft.util.Prediction.SERVER_ONLY);
+        }
         player.getInventory().removeItem(inputSlot, batch);
         ItemStack smelted = resultProto.copyWithCount(batch);
         player.getInventory().placeItemBackInInventory(smelted, net.minecraft.util.Prediction.SERVER_ONLY);
@@ -910,6 +914,10 @@ final class Actions {
     }
 
     private void sleepInBed() {
+        var bedRule = player.level().environmentAttributes().getValue(net.minecraft.world.attribute.EnvironmentAttributes.BED_RULE, player.blockPosition());
+        if (bedRule != null && bedRule.destroyOnUse()) {
+            throw new IllegalArgumentException("Beds explode in this dimension");
+        }
         BlockPos bedPos = BlockPos.betweenClosedStream(
                 player.blockPosition().offset(-4, -2, -4),
                 player.blockPosition().offset(4, 2, 4))
@@ -939,7 +947,6 @@ final class Actions {
         }
         BlockHitResult hit = new BlockHitResult(Vec3.atCenterOf(bedPos), Direction.UP, bedPos, false);
         player.level().getBlockState(bedPos).useWithoutItem(player.level(), player, hit);
-        finish(true, "Used bed / set respawn at " + bedPos.toShortString());
     }
 
     private List<String> availableTrades() {
@@ -950,9 +957,9 @@ final class Actions {
                     if (offer.isOutOfStock()) continue;
                     ItemStack costA = offer.getCostA();
                     ItemStack costB = offer.getCostB();
-                    boolean affordA = player.getInventory().countItem(costA.getItem()) >= costA.getCount();
-                    boolean affordB = costB.isEmpty() || player.getInventory().countItem(costB.getItem()) >= costB.getCount();
-                    if (affordA && affordB) {
+                    ItemStack playerA = new ItemStack(costA.getItem(), player.getInventory().countItem(costA.getItem()));
+                    ItemStack playerB = costB.isEmpty() ? ItemStack.EMPTY : new ItemStack(costB.getItem(), player.getInventory().countItem(costB.getItem()));
+                    if (offer.satisfiedBy(playerA, playerB)) {
                         String id = BuiltInRegistries.ITEM.getKey(offer.getResult().getItem()).toString();
                         if (!trades.contains(id)) trades.add(id);
                     }
@@ -980,11 +987,13 @@ final class Actions {
             if (!requestedItem.isEmpty() && !resultId.equals(requestedItem)) continue;
             ItemStack costA = offer.getCostA();
             ItemStack costB = offer.getCostB();
-            if (player.getInventory().countItem(costA.getItem()) < costA.getCount()) continue;
-            if (!costB.isEmpty() && player.getInventory().countItem(costB.getItem()) < costB.getCount()) continue;
+            ItemStack playerA = new ItemStack(costA.getItem(), player.getInventory().countItem(costA.getItem()));
+            ItemStack playerB = costB.isEmpty() ? ItemStack.EMPTY : new ItemStack(costB.getItem(), player.getInventory().countItem(costB.getItem()));
+            if (!offer.satisfiedBy(playerA, playerB)) continue;
             removeItemsFromInventory(costA.getItem(), costA.getCount());
             if (!costB.isEmpty()) removeItemsFromInventory(costB.getItem(), costB.getCount());
             offer.increaseUses();
+            merchant.notifyTrade(offer);
             ItemStack output = offer.assemble();
             player.getInventory().placeItemBackInInventory(output, net.minecraft.util.Prediction.SERVER_ONLY);
             player.inventoryMenu.broadcastChanges();
@@ -1043,7 +1052,7 @@ final class Actions {
     }
 
     private Direction horizontalDirectionToward(BlockPos heading) {
-        if (heading != null && !heading.equals(BlockPos.ZERO)) {
+        if (heading != null) {
             int dx = heading.getX() - player.blockPosition().getX();
             int dz = heading.getZ() - player.blockPosition().getZ();
             if (Math.abs(dx) >= Math.abs(dz) && dx != 0) {
@@ -1059,7 +1068,7 @@ final class Actions {
         Direction dir = horizontalDirectionToward(heading);
         BlockPos feetNow = player.blockPosition();
         // A heading below the player digs a staircase: clear head, feet and the step below, then walk down.
-        boolean descend = heading != null && !heading.equals(BlockPos.ZERO) && heading.getY() < feetNow.getY();
+        boolean descend = heading != null && heading.getY() < feetNow.getY();
         if (descend) {
             BlockPos ahead = feetNow.relative(dir);
             for (BlockPos candidate : List.of(ahead.above(), ahead, ahead.below())) {
@@ -1206,12 +1215,25 @@ final class Actions {
                         finish(true, recoveryMethod + "; landed");
                         return;
                     }
+                    if (action.equals("sleep")) {
+                        sleepInBed();
+                        return;
+                    }
                     finish(true, (recoveryMethod.isEmpty() ? "" : recoveryMethod + "; ")
                             + "Reached " + player.blockPosition().toShortString());
                     return;
                 }
             }
             switch (action) {
+                case "sleep" -> {
+                    if (player.isSleeping()) {
+                        sleeping = true;
+                    } else if (sleeping) {
+                        finish(true, "Finished sleeping in bed");
+                    } else if (ticks > 40 && !walking) {
+                        finish(false, "Could not sleep in bed");
+                    }
+                }
                 case "jump" -> {
                     if (ticks >= 8 && (player.onGround() || ticks >= 20)) {
                         pack().stopMovement();
@@ -1465,28 +1487,86 @@ final class Actions {
         return false;
     }
 
-    List<BlockPos> nearbyBlocks() {
+    private List<BlockPos> cachedNearbyBlocks = null;
+    private JsonObject cachedNearbyWorkstations = null;
+
+    private void scanNearbyBlocksAndWorkstations() {
         List<BlockPos> blocks = new ArrayList<>();
+        JsonObject stations = new JsonObject();
         BlockPos center = player.blockPosition();
-        for (BlockPos pos : BlockPos.betweenClosed(center.offset(-12, -5, -12), center.offset(12, 6, 12))) {
+        int ox = center.getX();
+        int oy = center.getY();
+        int oz = center.getZ();
+        double bestTable = Double.MAX_VALUE;
+        double bestFurnace = Double.MAX_VALUE;
+        double bestChest = Double.MAX_VALUE;
+        double bestBed = Double.MAX_VALUE;
+        double bestPortal = Double.MAX_VALUE;
+
+        int minX = -16, maxX = 16;
+        int minZ = -16, maxZ = 16;
+        int minY = -5, maxY = 6;
+
+        for (BlockPos pos : BlockPos.betweenClosed(center.offset(minX, minY, minZ), center.offset(maxX, maxY, maxZ))) {
             if (!player.level().isLoaded(pos)) continue;
             var state = player.level().getBlockState(pos);
-            if (state.isAir() || !state.getFluidState().isEmpty()) continue;
-            if (state.is(BlockTags.LEAVES) && pos.distManhattan(center) > 2) continue;
-            String id = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
-            if (isNonResourceGroundFoliage(id) && !pos.equals(center) && !pos.equals(center.above())) continue;
-            boolean exposed = false;
-            for (Direction direction : Direction.values()) {
-                var adj = player.level().getBlockState(pos.relative(direction));
-                if (adj.isAir() || adj.is(BlockTags.LEAVES) || adj.canBeReplaced()) {
-                    exposed = true;
-                    break;
+            if (state.isAir()) continue;
+
+            int dx = pos.getX() - ox;
+            int dy = pos.getY() - oy;
+            int dz = pos.getZ() - oz;
+
+            // Check workstations (-16..16, -4..4, -16..16)
+            if (dy >= -4 && dy <= 4) {
+                double dSq = dx * dx + dy * dy + dz * dz;
+                if (state.is(Blocks.CRAFTING_TABLE) && dSq < bestTable) {
+                    bestTable = dSq;
+                    stations.add("crafting_table", posJson(pos));
+                } else if ((state.is(Blocks.FURNACE) || state.is(Blocks.BLAST_FURNACE) || state.is(Blocks.SMOKER)) && dSq < bestFurnace) {
+                    bestFurnace = dSq;
+                    stations.add("furnace", posJson(pos));
+                } else if ((state.is(Blocks.CHEST) || state.is(Blocks.TRAPPED_CHEST) || state.is(Blocks.BARREL)) && dSq < bestChest) {
+                    bestChest = dSq;
+                    stations.add("chest", posJson(pos));
+                } else if (state.is(BlockTags.BEDS) && dSq < bestBed) {
+                    bestBed = dSq;
+                    stations.add("bed", posJson(pos));
+                } else if (state.is(Blocks.NETHER_PORTAL) && dSq < bestPortal) {
+                    bestPortal = dSq;
+                    stations.add("nether_portal", posJson(pos));
                 }
             }
-            if (exposed) blocks.add(pos.immutable());
+
+            // Check nearby blocks (-12..12, -5..6, -12..12)
+            if (dx >= -12 && dx <= 12 && dz >= -12 && dz <= 12 && dy >= -5 && dy <= 6) {
+                if (state.getFluidState().isEmpty()) {
+                    if (!(state.is(BlockTags.LEAVES) && pos.distManhattan(center) > 2)) {
+                        String id = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+                        if (!isNonResourceGroundFoliage(id) || pos.equals(center) || pos.equals(center.above())) {
+                            boolean exposed = false;
+                            for (Direction direction : Direction.values()) {
+                                var adj = player.level().getBlockState(pos.relative(direction));
+                                if (adj.isAir() || adj.is(BlockTags.LEAVES) || adj.canBeReplaced()) {
+                                    exposed = true;
+                                    break;
+                                }
+                            }
+                            if (exposed) blocks.add(pos.immutable());
+                        }
+                    }
+                }
+            }
         }
         blocks.sort(Comparator.comparingDouble(p -> p.distSqr(center)));
-        return blocks;
+        cachedNearbyBlocks = blocks;
+        cachedNearbyWorkstations = stations;
+    }
+
+    List<BlockPos> nearbyBlocks() {
+        if (cachedNearbyBlocks == null) {
+            scanNearbyBlocksAndWorkstations();
+        }
+        return cachedNearbyBlocks;
     }
 
     List<Entity> nearbyEntities() {
@@ -1497,6 +1577,9 @@ final class Actions {
     }
 
     JsonObject observe(List<String> chat) {
+        cachedNearbyBlocks = null;
+        cachedNearbyWorkstations = null;
+        scanNearbyBlocksAndWorkstations();
         JsonObject observation = new JsonObject();
         JsonArray pos = new JsonArray();
         pos.add(player.blockPosition().getX());
@@ -1761,45 +1844,10 @@ final class Actions {
     }
 
     private JsonObject captureNearbyWorkstations() {
-        JsonObject stations = new JsonObject();
-        BlockPos origin = player.blockPosition();
-        int ox = origin.getX();
-        int oy = origin.getY();
-        int oz = origin.getZ();
-        double bestTable = Double.MAX_VALUE;
-        double bestFurnace = Double.MAX_VALUE;
-        double bestChest = Double.MAX_VALUE;
-        double bestBed = Double.MAX_VALUE;
-        double bestPortal = Double.MAX_VALUE;
-
-        for (int dx = -16; dx <= 16; dx++) {
-            for (int dz = -16; dz <= 16; dz++) {
-                for (int dy = -4; dy <= 4; dy++) {
-                    wsScanCursor.set(ox + dx, oy + dy, oz + dz);
-                    if (!player.level().isLoaded(wsScanCursor)) continue;
-                    var s = player.level().getBlockState(wsScanCursor);
-                    if (s.isAir()) continue;
-                    double dSq = dx * dx + dy * dy + dz * dz;
-                    if (s.is(Blocks.CRAFTING_TABLE) && dSq < bestTable) {
-                        bestTable = dSq;
-                        stations.add("crafting_table", posJson(wsScanCursor));
-                    } else if ((s.is(Blocks.FURNACE) || s.is(Blocks.BLAST_FURNACE) || s.is(Blocks.SMOKER)) && dSq < bestFurnace) {
-                        bestFurnace = dSq;
-                        stations.add("furnace", posJson(wsScanCursor));
-                    } else if ((s.is(Blocks.CHEST) || s.is(Blocks.TRAPPED_CHEST) || s.is(Blocks.BARREL)) && dSq < bestChest) {
-                        bestChest = dSq;
-                        stations.add("chest", posJson(wsScanCursor));
-                    } else if (s.is(BlockTags.BEDS) && dSq < bestBed) {
-                        bestBed = dSq;
-                        stations.add("bed", posJson(wsScanCursor));
-                    } else if (s.is(Blocks.NETHER_PORTAL) && dSq < bestPortal) {
-                        bestPortal = dSq;
-                        stations.add("nether_portal", posJson(wsScanCursor));
-                    }
-                }
-            }
+        if (cachedNearbyWorkstations == null) {
+            scanNearbyBlocksAndWorkstations();
         }
-        return stations;
+        return cachedNearbyWorkstations;
     }
 
     private static JsonArray posJson(BlockPos p) {

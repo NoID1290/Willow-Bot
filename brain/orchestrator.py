@@ -262,17 +262,21 @@ class WillowBotOrchestrator:
                     skill_id = bundle.skill_id
                     skill_name = bundle.skill_name
                     skill_code = bundle.code
-                    selected_record = self.skill_store.register_skill(
-                        skill_id=skill_id,
-                        skill_name=skill_name,
-                        description=bundle.description,
-                        code=skill_code,
-                        task_id=task.id,
-                        preconditions={},
-                        postconditions=dict(task.target_items),
-                        verified=False,
-                        q_value=0.0,
-                    )
+                    if not skill_id.startswith("failed_"):
+                        preconds = dict(getattr(task, "preconditions", {}) or {})
+                        selected_record = self.skill_store.register_skill(
+                            skill_id=skill_id,
+                            skill_name=skill_name,
+                            description=bundle.description,
+                            code=skill_code,
+                            task_id=task.id,
+                            preconditions=preconds,
+                            postconditions=dict(task.target_items),
+                            verified=False,
+                            q_value=0.0,
+                        )
+                    else:
+                        selected_record = None
 
             # 4. Execute in AST-verified LRU-64 ScriptSandbox
             outcome: SandboxExecutionOutcome = await self.sandbox.execute_async(
@@ -333,13 +337,14 @@ class WillowBotOrchestrator:
         )
 
         # 7. Update SkillStore status (promote Verified or mark NeedsRefinement) & Reflexion Ring Buffer
-        self.skill_store.record_execution_feedback(
-            skill_id,
-            success=critic_eval.success,
-            updated_q=updated_q,
-        )
-        if critic_eval.success and selected_record is not None:
-            self.skill_store._bind_into_sandbox(selected_record)
+        if selected_record is not None:
+            self.skill_store.record_execution_feedback(
+                skill_id,
+                success=critic_eval.success,
+                updated_q=updated_q,
+            )
+            if critic_eval.success:
+                self.skill_store._bind_into_sandbox(selected_record)
 
         self.reflexion_log.record_if_needed(
             task_id=task.id,
@@ -381,78 +386,79 @@ class WillowBotOrchestrator:
 
     def observe_turn_transition(self, raw_observation: dict[str, Any]) -> dict[str, Any]:
         """Lightweight 0-LLM per-turn hook called by server.py's HTTP /decide loop."""
-        self.memory_pool.reflex_state.update_in_place(raw_observation)
-        last_res = raw_observation.get("last_result") if isinstance(raw_observation.get("last_result"), dict) else {}
-        status = str(last_res.get("status") or "")
+        with self._lock:
+            self.memory_pool.reflex_state.update_in_place(raw_observation)
+            last_res = raw_observation.get("last_result") if isinstance(raw_observation.get("last_result"), dict) else {}
+            status = str(last_res.get("status") or "")
 
-        if status == "success" and last_res.get("action") == "craft" and last_res.get("target"):
-            self._crafted_items.add(normalize_id(str(last_res["target"])))
+            if status == "success" and last_res.get("action") == "craft" and last_res.get("target"):
+                self._crafted_items.add(normalize_id(str(last_res["target"])))
 
-        snap = BotTelemetrySnapshot.from_observation(
-            raw_observation,
-            discovered_items=self._discovered_items,
-            crafted_items=self._crafted_items,
-        )
-        self._discovered_items.update(snap.discovered_unique_items)
-        self._crafted_items.update(snap.crafted_unique_items)
+            snap = BotTelemetrySnapshot.from_observation(
+                raw_observation,
+                discovered_items=self._discovered_items,
+                crafted_items=self._crafted_items,
+            )
+            self._discovered_items.update(snap.discovered_unique_items)
+            self._crafted_items.update(snap.crafted_unique_items)
 
-        last_reward: float | None = None
-        if self._prev_turn_snapshot is not None and self._prev_turn_task is not None and status in ("success", "failed"):
-            action_ok = status == "success"
-            act_res = (
-                ActionResult.ok(str(last_res.get("detail") or ""))
-                if action_ok
-                else ActionResult.fail("MISSING_ITEM", str(last_res.get("detail") or "failed"))
-            )
-            # Purely deterministic critic evaluation (llm_client=None -> 0ms overhead on live turn)
-            det_critic = SelfVerificationCritic(llm_client=None).evaluate_sync(
-                self._prev_turn_snapshot,
-                snap,
-                self._prev_turn_task,
-                act_res,
-            )
-            breakdown = RewardCalculator.calculate_episode_reward(
-                self._prev_turn_snapshot,
-                snap,
-                self._prev_turn_task,
-                det_critic,
-            )
-            last_reward = breakdown.r_total
-            c_prev = ContextStateHash.encode(self._prev_turn_snapshot)
-            c_curr = ContextStateHash.encode(snap)
-            next_obj = self.curriculum.get_next_objective(snap)
-            self.q_table.update(
-                context_prev=c_prev,
-                task_prev=self._prev_turn_task.id,
-                skill_id=self._prev_turn_skill_id,
-                reward_total=breakdown.r_total,
-                context_next=c_curr,
-                task_next=next_obj.id,
-            )
-            self.reflexion_log.record_if_needed(
-                self._prev_turn_task.id,
-                breakdown,
-                det_critic.success,
-                det_critic.cause,
-                det_critic.suggested_fix,
-            )
-            self.curriculum.record_outcome(self._prev_turn_task, det_critic.success, snap)
-        else:
-            next_obj = self.curriculum.get_next_objective(snap)
+            last_reward: float | None = None
+            if self._prev_turn_snapshot is not None and self._prev_turn_task is not None and status in ("success", "failed"):
+                action_ok = status == "success"
+                act_res = (
+                    ActionResult.ok(str(last_res.get("detail") or ""))
+                    if action_ok
+                    else ActionResult.fail("MISSING_ITEM", str(last_res.get("detail") or "failed"))
+                )
+                # Purely deterministic critic evaluation (llm_client=None -> 0ms overhead on live turn)
+                det_critic = SelfVerificationCritic(llm_client=None).evaluate_sync(
+                    self._prev_turn_snapshot,
+                    snap,
+                    self._prev_turn_task,
+                    act_res,
+                )
+                breakdown = RewardCalculator.calculate_episode_reward(
+                    self._prev_turn_snapshot,
+                    snap,
+                    self._prev_turn_task,
+                    det_critic,
+                )
+                last_reward = breakdown.r_total
+                c_prev = ContextStateHash.encode(self._prev_turn_snapshot)
+                c_curr = ContextStateHash.encode(snap)
+                next_obj = self.curriculum.get_next_objective(snap)
+                self.q_table.update(
+                    context_prev=c_prev,
+                    task_prev=self._prev_turn_task.id,
+                    skill_id=self._prev_turn_skill_id,
+                    reward_total=breakdown.r_total,
+                    context_next=c_curr,
+                    task_next=next_obj.id,
+                )
+                self.reflexion_log.record_if_needed(
+                    self._prev_turn_task.id,
+                    breakdown,
+                    det_critic.success,
+                    det_critic.cause,
+                    det_critic.suggested_fix,
+                )
+                self.curriculum.record_outcome(self._prev_turn_task, det_critic.success, snap)
+            else:
+                next_obj = self.curriculum.get_next_objective(snap)
 
-        self._prev_turn_snapshot = snap
-        self._prev_turn_task = next_obj
-        self._prev_turn_skill_id = f"turn_{next_obj.id}"
+            self._prev_turn_snapshot = snap
+            self._prev_turn_task = next_obj
+            self._prev_turn_skill_id = f"turn_{next_obj.id}"
 
-        return {
-            "active_node_id": next_obj.id,
-            "tier": next_obj.tier,
-            "objective": next_obj.description,
-            "postcondition": next_obj.verification_expr,
-            "completed_count": len(self.curriculum.completed_nodes),
-            "context_hash": ContextStateHash.encode(snap),
-            "last_reward": round(last_reward, 2) if last_reward is not None else None,
-        }
+            return {
+                "active_node_id": next_obj.id,
+                "tier": next_obj.tier,
+                "objective": next_obj.description,
+                "postcondition": next_obj.verification_expr,
+                "completed_count": len(self.curriculum.completed_nodes),
+                "context_hash": ContextStateHash.encode(snap),
+                "last_reward": round(last_reward, 2) if last_reward is not None else None,
+            }
 
     def start(self) -> None:
         """Launches both the 20Hz Reflex Loop thread and Low-Priority Slow Cognitive Loop worker."""

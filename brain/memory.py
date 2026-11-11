@@ -112,20 +112,21 @@ class Memory:
                     self.db.execute("INSERT OR REPLACE INTO seen_blocks VALUES (?,?,?,?,?,?)",
                                     (dimension, kind, *at, now))
         if isinstance(observation.get("nearby_blocks"), list):
-            for rx, ry, rz in self.db.execute(
-                "SELECT x,y,z FROM seen_blocks WHERE dimension=? AND abs(x-?)<=3 AND abs(y-?)<=3 AND abs(z-?)<=3",
+            candidates = self.db.execute(
+                "SELECT x,y,z FROM seen_blocks WHERE dimension=? AND abs(x-?)<=3 AND abs(y-?)<=3 AND abs(z-?)<=3 "
+                "AND NOT EXISTS (SELECT 1 FROM placed_blocks WHERE placed_blocks.dimension=seen_blocks.dimension "
+                "AND placed_blocks.x=seen_blocks.x AND placed_blocks.y=seen_blocks.y AND placed_blocks.z=seen_blocks.z "
+                "AND placed_blocks.state='present')",
                 (dimension, here[0], here[1], here[2]),
-            ).fetchall():
-                if (rx, ry, rz) not in nearby_positions:
-                    placed = self.db.execute(
-                        "SELECT 1 FROM placed_blocks WHERE dimension=? AND x=? AND y=? AND z=? AND state='present'",
-                        (dimension, rx, ry, rz),
-                    ).fetchone()
-                    if not placed:
-                        self.db.execute(
-                            "DELETE FROM seen_blocks WHERE dimension=? AND x=? AND y=? AND z=?",
-                            (dimension, rx, ry, rz),
-                        )
+            ).fetchall()
+            to_delete = [(x, y, z) for x, y, z in candidates if (x, y, z) not in nearby_positions]
+            if to_delete:
+                placeholders = ",".join("(?,?,?)" for _ in to_delete)
+                flat_params = [dimension] + [coord for pos in to_delete for coord in pos]
+                self.db.execute(
+                    f"DELETE FROM seen_blocks WHERE dimension=? AND (x, y, z) IN (VALUES {placeholders})",
+                    flat_params,
+                )
         for checked in observation.get("remembered_blocks", []):
             if not isinstance(checked, dict):
                 continue

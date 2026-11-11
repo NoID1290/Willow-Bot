@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import net.minecraft.core.BlockPos;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.world.entity.player.Inventory;
@@ -64,6 +65,17 @@ final class Crafting {
                 || stack.is(ItemTags.LOGS_THAT_BURN) || stack.is(ItemTags.PLANKS);
     }
 
+    static int fuelCapacity(ItemStack fuel) {
+        if (fuel.isEmpty()) return 0;
+        if (fuel.is(Items.LAVA_BUCKET)) return 100;
+        if (fuel.is(Items.COAL_BLOCK)) return 80;
+        if (fuel.is(Items.BLAZE_ROD)) return 12;
+        if (fuel.is(Items.COAL) || fuel.is(Items.CHARCOAL)) return 8;
+        if (fuel.is(ItemTags.LOGS_THAT_BURN) || fuel.is(ItemTags.PLANKS)) return 1;
+        if (fuel.is(Items.STICK)) return 1;
+        return 1;
+    }
+
     static ItemStack smeltResult(ItemStack input) {
         if (input.isEmpty()) return ItemStack.EMPTY;
         if (input.is(Items.RAW_IRON) || input.is(Items.IRON_ORE) || input.is(Items.DEEPSLATE_IRON_ORE))
@@ -108,14 +120,62 @@ final class Crafting {
         return items;
     }
 
-    static List<Plan> available(ServerPlayer player) {
+    private static long cachedGameTime = -1;
+    private static boolean cachedTableReachable = false;
+    private static int cachedInventoryHash = 0;
+    private static UUID cachedPlayerUuid = null;
+    private static List<Plan> cachedPlans = null;
+
+    public static synchronized void invalidateCache() {
+        cachedGameTime = -1;
+        cachedPlans = null;
+    }
+
+    private static int inventoryHash(ServerPlayer player) {
+        int hash = 1;
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = player.getInventory().getItem(i);
+            if (!stack.isEmpty()) {
+                hash = 31 * hash + stack.getItem().hashCode();
+                hash = 31 * hash + stack.getCount();
+            }
+        }
+        ItemStack offhand = player.getOffhandItem();
+        if (!offhand.isEmpty()) {
+            hash = 31 * hash + offhand.getItem().hashCode();
+            hash = 31 * hash + offhand.getCount();
+        }
+        return hash;
+    }
+
+    static synchronized List<Plan> available(ServerPlayer player) {
+        if (player == null || player.level() == null || player.level().getServer() == null) {
+            return List.of();
+        }
+        long gameTime = player.level().getGameTime();
         boolean table = tableReachable(player);
+        int invHash = inventoryHash(player);
+        UUID uuid = player.getUUID();
+
+        if (cachedPlans != null
+                && cachedGameTime == gameTime
+                && cachedTableReachable == table
+                && cachedInventoryHash == invHash
+                && uuid.equals(cachedPlayerUuid)) {
+            return cachedPlans;
+        }
+
         List<Plan> plans = new ArrayList<>();
         for (RecipeHolder<?> holder : player.level().getServer().getRecipeManager().getRecipes()) {
             Plan plan = plan(player, holder, table);
             if (plan != null) plans.add(plan);
         }
         plans.sort(java.util.Comparator.comparing(p -> p.holder().id().identifier().toString()));
+        cachedGameTime = gameTime;
+        cachedTableReachable = table;
+        cachedInventoryHash = invHash;
+        cachedPlayerUuid = uuid;
+        cachedPlans = plans;
         return plans;
     }
 
@@ -364,6 +424,7 @@ final class Crafting {
         }
         player.awardRecipes(List.of(plan.holder()));
         player.inventoryMenu.broadcastChanges();
+        invalidateCache();
         return "Crafted " + output.getCount() + " " + output.getItem().toString();
     }
 }

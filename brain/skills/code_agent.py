@@ -257,9 +257,18 @@ class CodeSkillAgent:
                 last_code = cand_code
                 new_name = cand_name
                 new_desc = cand_desc
+                syntax_err = ""
                 break
             except SandboxSecurityError as exc:
                 syntax_err = str(exc)
+
+        if syntax_err or last_code == old_code:
+            LOG.warning(
+                "[VOYAGER-SYNTH] Mutation syntax retries exhausted for '%s': %s; retaining existing skill without overwriting.",
+                skill_record.skill_id,
+                syntax_err,
+            )
+            return skill_record
 
         replaced = self.skill_store.replace_with_mutated_skill(
             skill_record.skill_id,

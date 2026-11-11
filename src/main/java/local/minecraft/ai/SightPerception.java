@@ -11,6 +11,9 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import javax.imageio.ImageIO;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -41,6 +44,22 @@ public final class SightPerception {
     private static volatile String lastLookingAt = "Air";
     private static volatile String lastVisible = "Clear FOV";
     private static volatile boolean snapshotEnabled = true;
+
+    private static final ExecutorService ENCODER_POOL = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "SightPerception-PNG-Encoder");
+        t.setDaemon(true);
+        return t;
+    });
+    private static volatile CompletableFuture<String> pendingSnapshot = null;
+    private static volatile String lastSnapshotBase64 = null;
+
+    public static CompletableFuture<String> getPendingSnapshot() {
+        return pendingSnapshot;
+    }
+
+    public static String getLastSnapshotBase64() {
+        return lastSnapshotBase64;
+    }
 
     public static String currentLookingAt() { return lastLookingAt; }
     public static String currentVisibleSummary() { return lastVisible; }
@@ -405,10 +424,20 @@ public final class SightPerception {
             g.drawLine(width / 2, height / 2 - 2, width / 2, height / 2 + 2);
             g.dispose();
 
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            ImageIO.write(image, "png", baos);
-            return Base64.getEncoder().encodeToString(baos.toByteArray());
-        } catch (IOException | RuntimeException e) {
+            pendingSnapshot = CompletableFuture.supplyAsync(() -> {
+                try {
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    ImageIO.write(image, "png", baos);
+                    String b64 = Base64.getEncoder().encodeToString(baos.toByteArray());
+                    lastSnapshotBase64 = b64;
+                    return b64;
+                } catch (IOException | RuntimeException e) {
+                    return null;
+                }
+            }, ENCODER_POOL);
+
+            return lastSnapshotBase64;
+        } catch (RuntimeException e) {
             return null;
         }
     }

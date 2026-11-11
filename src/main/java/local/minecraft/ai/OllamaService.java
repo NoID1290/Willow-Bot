@@ -159,21 +159,22 @@ public final class OllamaService {
     }
 
     public int unloadAll() {
+        return unloadAll(null);
+    }
+
+    public int unloadAll(String activeModel) {
         int count = 0;
-        // Unload any active STRATA processes
-        try {
-            var strataReq = HttpRequest.newBuilder(URI.create("http://127.0.0.1:8080/unload"))
-                    .timeout(Duration.ofSeconds(2)).header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString("{}")).build();
-            try (var http = client()) {
-                http.send(strataReq, HttpResponse.BodyHandlers.discarding());
-            }
-        } catch (Exception ignored) {}
-        try {
-            new ProcessBuilder("pkill", "-f", "serve/server.py").start().waitFor(2, TimeUnit.SECONDS);
-            new ProcessBuilder("pkill", "-f", "engine/strata").start().waitFor(2, TimeUnit.SECONDS);
-            new ProcessBuilder("pkill", "-f", "engine/strata-vision").start().waitFor(2, TimeUnit.SECONDS);
-        } catch (Exception ignored) {}
+        // Unload STRATA processes only if a STRATA model is active
+        if (activeModel != null && activeModel.toLowerCase(java.util.Locale.ROOT).contains("strata")) {
+            try {
+                var strataReq = HttpRequest.newBuilder(URI.create("http://127.0.0.1:8080/unload"))
+                        .timeout(Duration.ofSeconds(2)).header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString("{}")).build();
+                try (var http = client()) {
+                    http.send(strataReq, HttpResponse.BodyHandlers.discarding());
+                }
+            } catch (Exception ignored) {}
+        }
 
         try (var http = client()) {
             var response = http.send(HttpRequest.newBuilder(base.resolve("/api/ps"))

@@ -63,14 +63,19 @@ class ReflexionMemoryLog:
         self._writer_thread: threading.Thread | None = None
 
         if self.jsonl_path is not None:
-            self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-            self._flush_queue = queue.Queue(maxsize=256)
-            self._writer_thread = threading.Thread(
-                target=self._background_writer,
-                name="ReflexionJsonlFlusher",
-                daemon=True,
-            )
-            self._writer_thread.start()
+            try:
+                self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+                self._flush_queue = queue.Queue(maxsize=256)
+                self._writer_thread = threading.Thread(
+                    target=self._background_writer,
+                    name="ReflexionJsonlFlusher",
+                    daemon=True,
+                )
+                self._writer_thread.start()
+            except OSError:
+                self.jsonl_path = None
+                self._flush_queue = None
+                self._writer_thread = None
 
     def record_if_needed(
         self,

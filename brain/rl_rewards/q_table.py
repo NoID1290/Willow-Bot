@@ -184,8 +184,8 @@ class SkillQTable:
             prev_ema = float(self._skill_ema.get(skill_id, current_q))
             self._skill_ema[skill_id] = prev_ema + self.alpha * (float(reward_total) - prev_ema)
 
-        if self.storage_path is not None:
-            self.save()
+            if self.storage_path is not None:
+                self._save_locked()
         return updated_q
 
     def select_fast_path_skill(
@@ -221,21 +221,24 @@ class SkillQTable:
             return best_skill, best_q
         return None, 0.0
 
-    def save(self) -> None:
+    def _save_locked(self) -> None:
         if self.storage_path is None:
             return
-        with self._lock:
-            serializable = {
-                "alpha": self.alpha,
-                "gamma": self.gamma,
-                "fast_path_threshold": self.fast_path_threshold,
-                "q_values": {str(c): tasks for c, tasks in self._table.items()},
-                "skill_ema": dict(self._skill_ema),
-            }
+        serializable = {
+            "alpha": self.alpha,
+            "gamma": self.gamma,
+            "fast_path_threshold": self.fast_path_threshold,
+            "q_values": {str(c): tasks for c, tasks in self._table.items()},
+            "skill_ema": dict(self._skill_ema),
+        }
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.storage_path.with_suffix(".tmp")
+        tmp = self.storage_path.with_name(f"{self.storage_path.name}.tmp.{threading.get_ident()}")
         tmp.write_text(json.dumps(serializable, separators=(",", ":")), encoding="utf-8")
         tmp.replace(self.storage_path)
+
+    def save(self) -> None:
+        with self._lock:
+            self._save_locked()
 
     def load(self) -> None:
         if self.storage_path is None or not self.storage_path.is_file():

@@ -107,16 +107,17 @@ class RewardCalculator:
         diff = TelemetryStateDiff.compute(s_prev, s_curr)
 
         # 1. Extrinsic Advancement Rewards (R_adv)
+        verified = bool(task.verify(s_prev, s_curr))
+        task_succeeded = verified and bool(critic.success)
         r_adv = 0.0
         target_adv = normalize_id(task.advancement_id) if task.advancement_id else ""
         for adv in diff.new_advancements:
             norm_adv = normalize_id(adv)
-            bonus = 50.0 if (target_adv and norm_adv == target_adv) else 0.0
+            bonus = 50.0 if (target_adv and norm_adv == target_adv and task_succeeded) else 0.0
             r_adv += cls.advancement_base_value(norm_adv) + bonus
 
         # 2. Task Completion Reward (R_task)
-        verified = bool(task.verify(s_prev, s_curr))
-        if verified and critic.success:
+        if task_succeeded:
             r_task = float(task.base_reward)
         else:
             prog = max(0.0, min(1.0, float(task.progress_ratio(s_prev, s_curr))))

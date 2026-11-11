@@ -46,6 +46,9 @@ from modelprofile import (
 )
 from multimodal import ConcurrentPipeline
 from orchestrator import WillowBotOrchestrator
+from hardware_opt.llm_client import InferencePriority
+from rl_rewards.telemetry_snapshot import BotTelemetrySnapshot
+from rl_rewards.q_table import ContextStateHash
 
 LOG = logging.getLogger("localai")
 STEP = {
@@ -310,8 +313,10 @@ def stored_target(decision):
     target = decision.get("target", "")
     if target or decision.get("action") not in MOVEMENT_ACTIONS:
         return target
-    coords = [decision.get(k, 0) for k in "xyz"]
-    return "" if coords == [0, 0, 0] else f"{coords[0]},{coords[1]},{coords[2]}"
+    if not all(k in decision and decision[k] is not None for k in "xyz"):
+        return ""
+    coords = [decision[k] for k in "xyz"]
+    return f"{coords[0]},{coords[1]},{coords[2]}"
 
 
 def memory_target(action, target):
@@ -634,10 +639,11 @@ def validate_action(decision, observation):
     limits = (observation.get("_gameplay_limits") if isinstance(observation, dict) else None) or GAMEPLAY_LIMITS
     goto_range = int(limits.get("goto_max_range", GAMEPLAY_LIMITS["goto_max_range"]))
     goto_min = int(limits.get("goto_min_distance", GAMEPLAY_LIMITS["goto_min_distance"]))
-    dest = [decision[k] for k in "xyz"]
-    if decision["action"] == "goto" and dest != [0, 0, 0]:
+    has_coords = all(k in decision and decision[k] is not None for k in "xyz")
+    dest = [decision[k] for k in "xyz"] if has_coords else None
+    if decision["action"] == "goto" and dest is not None:
         if (isinstance(here, list) and len(here) == 3 and all(isinstance(v, (int, float)) for v in here)
-                and max(abs(decision[k] - here[i]) for i, k in enumerate("xyz")) < goto_min):
+                and max(abs(dest[i] - here[i]) for i in range(3)) < goto_min):
             raise ValueError("Already at or adjacent to goto destination; choose mine, place, pickup or explore")
         coord_csv = f"{dest[0]},{dest[1]},{dest[2]}"
         coord_space = f"{dest[0]} {dest[1]} {dest[2]}"
@@ -734,8 +740,8 @@ def validate_action(decision, observation):
     if decision["action"] == "mine" and decision["target"] not in action_targets(observation, "mine"):
         raise ValueError("Mine target has no reachable standing position from here; tunnel toward it "
                          "(a lower y digs a staircase down) or choose another block")
-    position = [decision[key] for key in ("x", "y", "z")]
-    if decision["action"] == "mine" and position != [0, 0, 0]:
+    if decision["action"] == "mine" and has_coords:
+        position = [decision[key] for key in ("x", "y", "z")]
         seen = any(block.get("id") == decision["target"] and block.get("at") == position
                    and block.get("reachable", True)
                    for block in observation.get("nearby_blocks", []) if isinstance(block, dict))
@@ -755,15 +761,19 @@ def validate_action(decision, observation):
         if decision["target"] not in action_targets(observation, "place"):
             raise ValueError("Placement target is not an owned unblocked block")
         sites = observation.get("crafting", {}).get("placement_sites", [])
-        if [decision[k] for k in ("x", "y", "z")] not in sites:
+        if [decision.get(k) for k in ("x", "y", "z")] not in sites:
             raise ValueError("Block placement is not a currently usable site")
     if decision["action"] == "attack" and decision["target"] not in action_targets(observation, "attack"):
         raise ValueError("Attack target is not an observed unblocked non-player entity")
     return decision
 
 
+_STRATA_PROCESS = None
+
+
 def ensure_strata_running(strata_url="http://127.0.0.1:8080", timeout=45, ollama="http://127.0.0.1:11434"):
     """Checks if STRATA endpoint is responsive; if not, unloads Ollama VRAM and launches local run-q2_0.sh."""
+    global _STRATA_PROCESS
     try:
         req = urllib.request.Request(f"{strata_url}/health")
         with urllib.request.urlopen(req, timeout=1.5) as resp:
@@ -781,9 +791,9 @@ def ensure_strata_running(strata_url="http://127.0.0.1:8080", timeout=45, ollama
         try:
             proc_check = subprocess.run(["pgrep", "-f", "serve/server.py"], capture_output=True, text=True)
             if not proc_check.stdout.strip():
-                subprocess.Popen(["/bin/bash", str(script)], cwd=str(script.parent),
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 start_new_session=True)
+                _STRATA_PROCESS = subprocess.Popen(["/bin/bash", str(script)], cwd=str(script.parent),
+                                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                   start_new_session=True)
         except Exception as e:
             LOG.warning("Failed to spawn STRATA run script: %s", e)
 
@@ -802,6 +812,7 @@ def ensure_strata_running(strata_url="http://127.0.0.1:8080", timeout=45, ollama
 
 def unload_active_model(model=None, ollama="http://127.0.0.1:11434", strata_url="http://127.0.0.1:8080"):
     """Unloads the active model from VRAM/RAM when stopping Willow or shutting down."""
+    global _STRATA_PROCESS
     if model and ("strata" in model.lower()):
         # Unload STRATA engine via /unload endpoint and terminate server process
         try:
@@ -810,13 +821,20 @@ def unload_active_model(model=None, ollama="http://127.0.0.1:11434", strata_url=
                 LOG.info("STRATA model unloaded: HTTP %d", resp.status)
         except Exception as e:
             LOG.debug("STRATA unload request error: %s", e)
-        try:
-            subprocess.run(["pkill", "-f", "serve/server.py"], capture_output=True, timeout=3)
-            subprocess.run(["pkill", "-f", "engine/strata"], capture_output=True, timeout=3)
-            subprocess.run(["pkill", "-f", "engine/strata-vision"], capture_output=True, timeout=3)
-            LOG.info("Stopped STRATA background processes on model unload")
-        except Exception as e:
-            LOG.debug("STRATA process termination error: %s", e)
+        if _STRATA_PROCESS is not None:
+            try:
+                if _STRATA_PROCESS.poll() is None:
+                    _STRATA_PROCESS.terminate()
+                    try:
+                        _STRATA_PROCESS.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        _STRATA_PROCESS.kill()
+                        _STRATA_PROCESS.wait(timeout=2)
+                LOG.info("Stopped tracked STRATA background process on model unload")
+            except Exception as e:
+                LOG.debug("STRATA process termination error: %s", e)
+            finally:
+                _STRATA_PROCESS = None
         return
 
     # Unload Ollama models
@@ -854,25 +872,14 @@ class Brain:
         self.profile_path = Path(database).parent / "model-profile.json"
         self.status_path = None if str(database) == ":memory:" else Path(database).parent / "status.json"
         self.started_at = time.time()
-        self.db = sqlite3.connect(database)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS decisions
-              (id TEXT PRIMARY KEY, created REAL, action TEXT, target TEXT,
-               goal TEXT, hypothesis TEXT, result TEXT);
-            CREATE TABLE IF NOT EXISTS lessons
-              (id TEXT PRIMARY KEY, text TEXT NOT NULL, used REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS places
-              (kind TEXT, x INTEGER, y INTEGER, z INTEGER, seen REAL,
-               PRIMARY KEY(kind,x,y,z));
-        """)
-        self.db.commit()
-        self.skills = SkillLibrary(self.db, Path(database).parent / "skills")
-        self.experience = Experience(self.db)
-        self.memory = Memory(self.db, Path(database).parent / "memory.json")
+        self.db = None
+        self.skills = None
+        self.experience = None
+        self.memory = None
+        self.planner = None
+        self.pipeline = None
+        self.orchestrator = None
         self.decisions_since_export = 0
-        self.planner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="willow-strategist") if planning else None
         self.pending_plan = None
         self.next_plan = 0
         self.plan_started = 0
@@ -899,32 +906,95 @@ class Brain:
         self.consecutive_skill_count = 0
         self.consecutive_skill_no_progress = 0
         self._inference_lock = threading.Lock()
+        self._state_lock = threading.RLock()
         self._active_inferences = 0
         self._active_actor_inferences = 0
         self._hardware = None
-        self.pipeline = ConcurrentPipeline(model=self.model, profile=self.profile, ollama=self.ollama)
-        self.orchestrator = WillowBotOrchestrator(
-            storage_dir=Path(database).parent,
-            resident_model=self.model,
-            ollama_url=self.ollama,
-        )
+
+        try:
+            self.db = sqlite3.connect(database, check_same_thread=False)
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.executescript("""
+                CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS decisions
+                  (id TEXT PRIMARY KEY, created REAL, action TEXT, target TEXT,
+                   goal TEXT, hypothesis TEXT, result TEXT);
+                CREATE TABLE IF NOT EXISTS lessons
+                  (id TEXT PRIMARY KEY, text TEXT NOT NULL, used REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS places
+                  (kind TEXT, x INTEGER, y INTEGER, z INTEGER, seen REAL,
+                   PRIMARY KEY(kind,x,y,z));
+            """)
+            self.db.commit()
+            self.skills = SkillLibrary(self.db, Path(database).parent / "skills")
+            self.experience = Experience(self.db)
+            self.memory = Memory(self.db, Path(database).parent / "memory.json")
+            self.planner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="willow-strategist") if planning else None
+            self.pipeline = ConcurrentPipeline(model=self.model, profile=self.profile, ollama=self.ollama)
+            self.orchestrator = WillowBotOrchestrator(
+                storage_dir=Path(database).parent,
+                resident_model=self.model,
+                ollama_url=self.ollama,
+            )
+            if hasattr(self.orchestrator, "optimizer") and self.orchestrator.optimizer:
+                self.orchestrator.optimizer.align_with_profile(self.profile, keep_alive=self.keep_alive)
+            if hasattr(self.orchestrator, "q_table") and self.orchestrator.q_table:
+                self.experience.q_table = self.orchestrator.q_table
+            if hasattr(self.orchestrator, "llm_client") and self.orchestrator.llm_client:
+                self.inference_gate = self.orchestrator.llm_client.gate
+        except Exception:
+            self._cleanup_resources()
+            raise
+
+    def _cleanup_resources(self):
+        if getattr(self, "orchestrator", None):
+            try:
+                self.orchestrator.stop()
+            except Exception:
+                pass
+            self.orchestrator = None
+        if getattr(self, "pipeline", None):
+            try:
+                self.pipeline.close()
+            except Exception:
+                pass
+            self.pipeline = None
+        if getattr(self, "planner", None):
+            try:
+                self.planner.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self.planner = None
+        if getattr(self, "db", None):
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            self.db = None
 
     def close(self):
-        if hasattr(self, "orchestrator") and self.orchestrator:
-            self.orchestrator.stop()
-        if hasattr(self, "pipeline") and self.pipeline:
-            self.pipeline.close()
-        if self.planner:
-            self.planner.shutdown(wait=True, cancel_futures=True)
-        try:
-            self.memory.export()
-        except (OSError, sqlite3.Error) as exc:
-            LOG.warning("Could not export memory.json: %s", exc)
-        self.db.close()
-        try:
-            unload_active_model(self.model, ollama=self.ollama)
-        except Exception as exc:
-            LOG.debug("Error during model unload: %s", exc)
+        with self._state_lock:
+            if hasattr(self, "orchestrator") and self.orchestrator:
+                self.orchestrator.stop()
+                self.orchestrator = None
+            if hasattr(self, "pipeline") and self.pipeline:
+                self.pipeline.close()
+                self.pipeline = None
+            if self.planner:
+                self.planner.shutdown(wait=True, cancel_futures=True)
+                self.planner = None
+            if self.memory:
+                try:
+                    self.memory.export()
+                except (OSError, sqlite3.Error) as exc:
+                    LOG.warning("Could not export memory.json: %s", exc)
+            if self.db:
+                self.db.close()
+                self.db = None
+            try:
+                unload_active_model(self.model, ollama=self.ollama)
+            except Exception as exc:
+                LOG.debug("Error during model unload: %s", exc)
 
     def role_prompt_bytes(self, role="actor"):
         if self.profile:
@@ -938,9 +1008,42 @@ class Brain:
     def prompt_bytes(self):
         return self.role_prompt_bytes("actor")
 
+    @prompt_bytes.setter
+    def prompt_bytes(self, value):
+        if self.profile is None:
+            self.profile = {}
+        self.profile["prompt_bytes"] = int(value)
+
+    @property
+    def v2_step_queue(self):
+        return self.steps
+
+    @v2_step_queue.setter
+    def v2_step_queue(self, val):
+        self.steps = val
+
+    def queue_steps(self, steps, goal="plan", observation=None):
+        self.steps = list(steps)
+        self.steps_goal = goal
+        self.steps_dimension = observation.get("dimension") if observation else "minecraft:overworld"
+        self.steps_deadline = time.monotonic() + self.steps_deadline_seconds
+        self.steps_health = observation.get("health", 20) if observation else 20
+        self.steps_food = observation.get("food", 20) if observation else 20
+        self.steps_last_id = observation.get("last_result", {}).get("id") if observation else None
+
+    def call_model(self, messages, schema=None, role="actor", **kwargs):
+        if schema is None:
+            schema = SCHEMA if role == "actor" else PLAN_SCHEMA
+        return self.inference(messages, schema, role=role, **kwargs)
+
     @property
     def bytes_per_token(self):
-        return float(self.profile.get("bytes_per_token") or modelprofile.BYTES_PER_TOKEN) if self.profile else modelprofile.BYTES_PER_TOKEN
+        val = (self.profile.get("bytes_per_token") if self.profile else None) or modelprofile.BYTES_PER_TOKEN
+        try:
+            val = float(val)
+        except (ValueError, TypeError):
+            val = modelprofile.BYTES_PER_TOKEN
+        return max(0.1, val)
 
     @property
     def prompt_tokens(self):
@@ -1097,6 +1200,8 @@ class Brain:
         self.thinking = profile["thinking"]
         if hasattr(self, "pipeline") and self.pipeline:
             self.pipeline.profile = profile
+        if hasattr(self, "orchestrator") and self.orchestrator and hasattr(self.orchestrator, "optimizer"):
+            self.orchestrator.optimizer.align_with_profile(profile, keep_alive=self.keep_alive)
         LOG.info("Model profile model=%s arch=%s params=%s quant=%s trained_ctx=%s ctx=%s kv_cache=%sMiB "
                  "moe_experts=%s thinking=%s actor_tokens=%s plan_tokens=%s prompt_bytes=%s options=%s",
                  self.model, profile["architecture"], profile["parameter_size"], profile["quantization"],
@@ -1296,35 +1401,47 @@ class Brain:
                 raise OSError("Ollama response exceeds size limit")
             return json.loads(raw_bytes)
 
-        payload = _send_ollama(request)
-        if payload.get("done_reason") == "length" and request.get("think") and (timeout - (time.monotonic() - started)) > 3.0:
-            non_think_cap = max(384, min(1024, output))
-            LOG.warning("role=%s exhausted num_predict=%s while thinking; retrying with think=False (num_predict=%s)",
-                        role, output, non_think_cap)
-            retry_req = dict(request, think=False, options=dict(request["options"], num_predict=non_think_cap))
-            payload = _send_ollama(retry_req)
-            if payload.get("done_reason") != "length":
-                # Only the role that ran out of budget stops thinking; the other role keeps its own settings.
-                role_profile = (profile.get("roles") or {}).get(role)
-                if isinstance(role_profile, dict):
-                    role_profile["think"] = False
-                    role_profile["think_value"] = False
-                    role_profile["num_predict"] = non_think_cap
-                if role == "actor":
-                    profile["thinking"] = False
-                    profile["think_value"] = False
-                    profile["actor_tokens"] = non_think_cap
-                else:
-                    profile["plan_tokens"] = non_think_cap
-        if payload.get("done_reason") == "length":
-            raise ValueError("Model exhausted output budget; refusing partial response")
-        self._update_live_metrics(profile, msg_bytes, payload)
-        LOG.info("role=%s prompt_tokens=%s cached=%s generated_tokens=%s elapsed=%.2fs prompt_tps=%s gen_tps=%s", role,
-                 payload.get("prompt_eval_count"), payload.get("prompt_eval_cached_count", "-"),
-                 payload.get("eval_count"), time.monotonic() - started,
-                 rate(payload.get("prompt_eval_count"), payload.get("prompt_eval_duration")),
-                 rate(payload.get("eval_count"), payload.get("eval_duration")))
-        return json.loads(payload["message"]["content"])
+        gate = getattr(self, "inference_gate", None)
+        if gate is None and hasattr(self, "orchestrator") and self.orchestrator:
+            gate = getattr(getattr(self.orchestrator, "llm_client", None), "gate", None)
+            self.inference_gate = gate
+
+        priority = InferencePriority.REFLEX_DECISION if role == "actor" else InferencePriority.TASK_DECOMPOSITION
+        if gate is not None:
+            gate.acquire(priority=priority, timeout=timeout)
+        try:
+            payload = _send_ollama(request)
+            if payload.get("done_reason") == "length" and request.get("think") and (timeout - (time.monotonic() - started)) > 3.0:
+                non_think_cap = max(384, min(1024, output))
+                LOG.warning("role=%s exhausted num_predict=%s while thinking; retrying with think=False (num_predict=%s)",
+                            role, output, non_think_cap)
+                retry_req = dict(request, think=False, options=dict(request["options"], num_predict=non_think_cap))
+                payload = _send_ollama(retry_req)
+                if payload.get("done_reason") != "length":
+                    # Only the role that ran out of budget stops thinking; the other role keeps its own settings.
+                    role_profile = (profile.get("roles") or {}).get(role)
+                    if isinstance(role_profile, dict):
+                        role_profile["think"] = False
+                        role_profile["think_value"] = False
+                        role_profile["num_predict"] = non_think_cap
+                    if role == "actor":
+                        profile["thinking"] = False
+                        profile["think_value"] = False
+                        profile["actor_tokens"] = non_think_cap
+                    else:
+                        profile["plan_tokens"] = non_think_cap
+            if payload.get("done_reason") == "length":
+                raise ValueError("Model exhausted output budget; refusing partial response")
+            self._update_live_metrics(profile, msg_bytes, payload)
+            LOG.info("role=%s prompt_tokens=%s cached=%s generated_tokens=%s elapsed=%.2fs prompt_tps=%s gen_tps=%s", role,
+                     payload.get("prompt_eval_count"), payload.get("prompt_eval_cached_count", "-"),
+                     payload.get("eval_count"), time.monotonic() - started,
+                     rate(payload.get("prompt_eval_count"), payload.get("prompt_eval_duration")),
+                     rate(payload.get("eval_count"), payload.get("eval_duration")))
+            return json.loads(payload["message"]["content"])
+        finally:
+            if gate is not None:
+                gate.release()
 
     def think_plan(self, messages):
         value = self.inference(messages, PLAN_SCHEMA, "strategist", timeout=self.plan_timeout)
@@ -1383,6 +1500,10 @@ class Brain:
         return value
 
     def update_planner(self, observation):
+        with self._state_lock:
+            return self._update_planner_locked(observation)
+
+    def _update_planner_locked(self, observation):
         if not self.planner:
             return
         now = time.monotonic()
@@ -1455,6 +1576,10 @@ class Brain:
                 LOG.debug("Background strategist failure details:", exc_info=True)
 
     def schedule_planner(self, observation, messages):
+        with self._state_lock:
+            return self._schedule_planner_locked(observation, messages)
+
+    def _schedule_planner_locked(self, observation, messages):
         if not self.planner:
             return
         planner_mode = (self.profile or {}).get("planner_mode")
@@ -1540,6 +1665,10 @@ class Brain:
         self.pending_plan = self.planner.submit(self.think_plan, plan_messages)
 
     def record_result(self, observation):
+        with self._state_lock:
+            return self._record_result_locked(observation)
+
+    def _record_result_locked(self, observation):
         result = observation.get("last_result", {})
         if not isinstance(result, dict):
             raise ValueError("last_result must be an object")
@@ -1592,6 +1721,10 @@ class Brain:
         ]
 
     def perceive(self, observation):
+        with self._state_lock:
+            return self._perceive_locked(observation)
+
+    def _perceive_locked(self, observation):
         self.record_result(observation)
         if hasattr(self, "pipeline") and self.pipeline:
             self.pipeline.ingest(observation)
@@ -1685,7 +1818,7 @@ class Brain:
         # prefix (and only once that prefix exceeds roughly 1k tokens), so slow-changing memory/inventory
         # data comes first and anything that changes every decision comes last.
         stable_keys = ("inventory", "placeable", "milestones", "craftable", "smeltable", "trades",
-                       "lookup", "blocked_actions", "inventory_change", "dimension", "biome")
+                       "lookup", "blocked_actions", "inventory_change", "dimension", "biome", "v2_curriculum")
         volatile_keys = ("crafting", "position", "health", "food", "air", "on_ground", "in_water", "time",
                          "weather", "terrain", "diagnosis", "nearby_blocks", "visible_tree", "entities", "seeing",
                          "listening", "doing", "sight", "hearing", "lfm_omni_synthesis", "active_tools",
@@ -1860,16 +1993,25 @@ class Brain:
 
             while True:
                 # Cache-friendly prompt ordering: static instructions/rules first, volatile observation last
+                user_content = compact(context)
                 messages = [{"role": "system", "content": system_prompt},
-                            {"role": "user", "content": compact(context)}]
-                if len(compact(messages).encode()) + schema_bytes <= target_budget:
+                            {"role": "user", "content": user_content}]
+                current_size = len(compact(messages).encode()) + schema_bytes
+                if current_size <= target_budget:
                     return messages
+                overflow = current_size - target_budget
                 candidates = [key for key, minimum in minimums.items()
                               if isinstance(context.get(key), list) and len(context[key]) > minimum]
                 if not candidates:
                     break
-                key = max(candidates, key=lambda name: len(compact(context[name])))
-                context[key] = context[key][:-1]
+                candidate_sizes = {name: len(compact(context[name])) for name in candidates}
+                key = max(candidates, key=lambda name: candidate_sizes[name])
+                key_len = len(context[key])
+                min_len = minimums[key]
+                max_removable = key_len - min_len
+                avg_item_size = max(1, candidate_sizes[key] // max(1, key_len))
+                items_to_drop = max(1, min(max_removable, (overflow + avg_item_size - 1) // avg_item_size))
+                context[key] = context[key][:-items_to_drop]
 
         messages = [{"role": "system", "content": system_prompt},
                     {"role": "user", "content": compact(context)}]
@@ -1958,11 +2100,11 @@ class Brain:
         # 3. If mining a tree log without a follow-up plan, chain up to 6 follow-up trunk logs
         if (from_actor and decision["action"] == "mine" and decision["target"].endswith(("_log", "_stem"))
                 and not decision.get("plan") and len(nearby_logs) > 1):
-            cur_pos = [decision["x"], decision["y"], decision["z"]]
+            cur_pos = [decision[k] for k in "xyz"] if all(k in decision and decision[k] is not None for k in "xyz") else None
             max_chain = min(6, DECISION_LIMITS["plan"])
             chained = []
             for blk in nearby_logs:
-                if blk.get("at") == cur_pos:
+                if cur_pos is not None and blk.get("at") == cur_pos:
                     continue
                 chained.append({
                     "action": "mine",
@@ -1978,10 +2120,13 @@ class Brain:
         return decision
 
     def decide(self, observation):
+        with self._state_lock:
+            return self._decide_locked(observation)
+
+    def _decide_locked(self, observation):
         observation = self.perceive(observation)
         reflex = self.pipeline.check_reflex(observation) if hasattr(self, "pipeline") and self.pipeline else None
         if reflex:
-            LOG.warning("Immediate sensory emergency reflex triggered: %s", reflex.get("goal"))
             reflex_id = str(uuid.uuid4())
             reflex["id"] = reflex_id
             reflex.setdefault("target", "")
@@ -1991,12 +2136,18 @@ class Brain:
             reflex.setdefault("say", "")
             reflex.setdefault("memory", "")
             reflex.setdefault("waypoint", "")
-            with self.db:
-                self.db.execute("INSERT INTO decisions VALUES (?,?,?,?,?,?,NULL)",
-                                (reflex_id, time.time(), reflex["action"], reflex["target"],
-                                 reflex["goal"], reflex["memory"]))
-            self._export_status(observation, reflex, "reflex", 0.0)
-            return reflex
+            try:
+                reflex = validate_action(reflex, observation)
+                LOG.warning("Immediate sensory emergency reflex triggered: %s", reflex.get("goal"))
+                with self.db:
+                    self.db.execute("INSERT INTO decisions VALUES (?,?,?,?,?,?,NULL)",
+                                    (reflex_id, time.time(), reflex["action"], reflex["target"],
+                                     reflex["goal"], reflex["memory"]))
+                    self.experience.remember(reflex_id, reflex["action"], reflex["target"], observation)
+                self._export_status(observation, reflex, "reflex", 0.0)
+                return reflex
+            except (ValueError, TypeError, KeyError) as exc:
+                LOG.warning("Emergency reflex action %s was invalid (%s); falling back to cognitive cycle", reflex, exc)
         self.ensure_profile(timeout=self.actor_timeout)
         self.update_planner(observation)
         # A plan rejected on the previous request (HTTP 422) executed nothing, so last_result is unchanged;
@@ -2039,6 +2190,53 @@ class Brain:
                 except (ValueError, TypeError, KeyError) as exc:
                     LOG.info("Plan precondition changed; replanning: %s", exc)
                     self.steps.clear()
+        # Wire verified V2 skills / Q-fast-path execution via step-queue adapter over WillowBotActions
+        if (decision is None and hasattr(self, "orchestrator") and self.orchestrator
+                and not observation.get("chat") and not observation.get("diagnosis", {}).get("stuck")
+                and observation.get("last_result", {}).get("status") != "failed"
+                and observation.get("food", 20) >= danger_food and observation.get("health", 20) >= danger_health
+                and not any(entity.get("hostile") and entity.get("distance", 99) < danger_dist
+                            for entity in observation.get("entities", []))):
+            try:
+                snap = BotTelemetrySnapshot.from_observation(observation)
+                ctx_hash = ContextStateHash.encode(snap)
+                next_task = self.orchestrator.curriculum.get_next_objective(snap)
+                verified_candidates = self.orchestrator.skill_store.get_verified_skills_for_task(next_task.id, snap)
+                fast_skill_id, fast_q = self.orchestrator.q_table.select_fast_path_skill(
+                    ctx_hash,
+                    next_task.id,
+                    [r.skill_id for r in verified_candidates],
+                )
+                if fast_skill_id is None and verified_candidates:
+                    cand_rec = verified_candidates[0]
+                    if cand_rec.q_value >= 0.0:
+                        fast_skill_id = cand_rec.skill_id
+
+                if fast_skill_id:
+                    skill_code = self.orchestrator.skill_store.load_code(fast_skill_id)
+                    from execution.bot_actions import WillowBotActions
+                    bot_sim = WillowBotActions(snap, pool=self.orchestrator.memory_pool)
+                    outcome = self.orchestrator.sandbox.execute_sync(
+                        skill_code,
+                        bot_sim,
+                        skill_name=fast_skill_id,
+                        timeout_ms=3000,
+                    )
+                    if outcome.action_result.Success and bot_sim.emitted_steps:
+                        first_step = dict(bot_sim.emitted_steps[0], goal=next_task.description or fast_skill_id, say="", memory="")
+                        valid_first = validate_action(first_step, observation)
+                        self.steps = list(bot_sim.emitted_steps[1:])
+                        self.steps_goal = next_task.description or fast_skill_id
+                        self.steps_last_id = observation.get("last_result", {}).get("id")
+                        self.steps_food = observation.get("food", 20)
+                        self.steps_health = observation.get("health", 20)
+                        self.steps_dimension = observation.get("dimension")
+                        self.steps_deadline = time.monotonic() + 30.0
+                        decision = valid_first
+                        skill_id = fast_skill_id
+                        source = f"v2_skill:{fast_skill_id}"
+            except Exception as exc:
+                LOG.debug("V2 fast-path / skill execution skipped: %s", exc)
         if (decision is None and not observation.get("chat") and not observation.get("diagnosis", {}).get("stuck")
                 and observation.get("last_result", {}).get("status") != "failed"
                 and observation.get("food", 20) >= danger_food and observation.get("health", 20) >= danger_health

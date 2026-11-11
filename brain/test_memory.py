@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -121,6 +122,27 @@ class MemoryTests(unittest.TestCase):
     def test_far_goto_heads_toward_destination(self):
         value = validate_action(decision(action="goto", x=300, y=70, z=-40), self.observation)
         self.assertEqual((value["action"], value["x"], value["y"], value["z"]), ("explore", 300, 70, -40))
+
+    def test_batch_seen_blocks_pruning(self):
+        now = time.time()
+        dim = "minecraft:overworld"
+        self.brain.db.execute("INSERT OR REPLACE INTO seen_blocks VALUES (?,?,?,?,?,?)", (dim, "minecraft:stone", 10, 64, 11, now))
+        self.brain.db.execute("INSERT OR REPLACE INTO seen_blocks VALUES (?,?,?,?,?,?)", (dim, "minecraft:dirt", 11, 64, 10, now))
+        self.brain.db.execute("INSERT OR REPLACE INTO seen_blocks VALUES (?,?,?,?,?,?)", (dim, "minecraft:iron_ore", 12, 64, 10, now))
+        self.brain.db.execute("INSERT OR REPLACE INTO placed_blocks VALUES (?,?,?,?,?,?,?,'present')",
+                              (dim, 10, 64, 11, "minecraft:stone", now, now))
+
+        # Observation where [12, 64, 10] disappeared from nearby_blocks
+        obs = dict(self.observation,
+                   position=[10, 64, 10],
+                   dimension=dim,
+                   nearby_blocks=[{"id": "minecraft:dirt", "at": [11, 64, 10]}])
+        self.brain.memory.observe(obs)
+
+        remaining = set(self.brain.db.execute("SELECT x,y,z FROM seen_blocks WHERE dimension=?", (dim,)).fetchall())
+        self.assertNotIn((12, 64, 10), remaining, "Disappeared unplaced block must be pruned by batch delete")
+        self.assertIn((10, 64, 11), remaining, "Placed block must be preserved even if absent from nearby_blocks")
+        self.assertIn((11, 64, 10), remaining, "Present block must remain in seen_blocks")
 
 
 if __name__ == "__main__":

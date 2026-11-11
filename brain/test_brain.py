@@ -757,6 +757,52 @@ class BrainTests(unittest.TestCase):
                         [obs, obs], validate_action_fn=validate_action)
         self.assertTrue(ok, "a guarded explore that stays silent on some observations is acceptable")
 
+    def test_shared_inference_gate_routing(self):
+        from unittest.mock import MagicMock
+        from hardware_opt.llm_client import InferencePriority
+        mock_gate = MagicMock()
+        self.brain.inference_gate = mock_gate
+        valid_dec = json.dumps({"action": "explore", "target": "", "x": 0, "y": 0, "z": 0,
+                                "goal": "Look around", "say": "", "memory": "", "waypoint": "", "plan": []})
+        fake_response = json.dumps({"message": {"content": valid_dec}, "done_reason": "stop"}).encode()
+        resp_obj = MagicMock()
+        resp_obj.read.return_value = fake_response
+        resp_obj.__enter__.return_value = resp_obj
+
+        with patch("urllib.request.urlopen", return_value=resp_obj):
+            self.brain.call_model([{"role": "user", "content": "{}"}], role="actor")
+
+        mock_gate.acquire.assert_called_once_with(priority=InferencePriority.REFLEX_DECISION, timeout=unittest.mock.ANY)
+        mock_gate.release.assert_called_once()
+
+    def test_fast_path_step_queue_execution_in_decide(self):
+        obs = {
+            "position": [0, 64, 0], "health": 20, "food": 20, "dimension": "minecraft:overworld",
+            "nearby_blocks": [{"id": "minecraft:oak_log", "at": [1, 64, 0]}],
+            "entities": [], "craftable": [], "inventory": [],
+            "last_result": {"id": "step-0", "status": "success"},
+        }
+        step = decision(action="mine", target="minecraft:oak_log", x=1, y=64, z=0)
+        self.brain.queue_steps([step], goal="mine log", observation=obs)
+
+        with patch.object(self.brain, "inference", side_effect=AssertionError("Inference should not be called")):
+            dec = self.brain.decide(obs)
+
+        self.assertEqual(dec["action"], "mine")
+        self.assertEqual(dec["target"], "minecraft:oak_log")
+        self.assertEqual([dec["x"], dec["y"], dec["z"]], [1, 64, 0])
+        self.assertEqual(len(self.brain.v2_step_queue), 0, "Step queue should be consumed")
+
+    def test_prompt_trimming_batch(self):
+        obs = {
+            "position": [0, 64, 0], "health": 20, "food": 20, "dimension": "minecraft:overworld",
+            "nearby_blocks": [{"id": f"minecraft:stone", "at": [i, 64, 0]} for i in range(40)],
+            "entities": [], "craftable": [], "inventory": [],
+        }
+        self.brain.prompt_bytes = 4500
+        msgs = self.brain.messages(obs, role="actor")
+        self.assertLessEqual(len(json.dumps(msgs).encode()), 4500)
+
 
 if __name__ == "__main__":
     unittest.main()

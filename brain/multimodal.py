@@ -30,7 +30,18 @@ LFM_FAMILY_MODELS = [
 
 
 def warm_lfm_family(ollama_url="http://127.0.0.1:11434", timeout=5):
-    """Pre-warms the full LFM3 family in Ollama concurrently with keep_alive."""
+    """Pre-warms the full LFM3 family in Ollama concurrently with keep_alive if sufficient VRAM exists."""
+    try:
+        from .modelprofile import detect_hardware
+        hw = detect_hardware()
+        vram = hw.get("gpu_vram_mib") or 0
+    except Exception:
+        vram = 0
+
+    if vram < 24000:
+        LOG.info("Skipping 6-model LFM preloading (VRAM %d MiB < 24000 MiB threshold)", vram)
+        return []
+
     def _warm_one(model_name):
         try:
             req = urllib.request.Request(
@@ -197,15 +208,22 @@ class VisionProcessor(threading.Thread):
         fallback = f"Gaze on {looking}. Entities: {', '.join(entities) if entities else 'none'}. {summary}".strip()
         try:
             prompt = f"Vision check: facing {sight.get('facing', 'unknown')}, looking at {looking}. Entities: {', '.join(entities) if entities else 'none'}. {summary}"
+            payload = {
+                "model": self.vl_model,
+                "prompt": prompt,
+                "stream": False,
+                "keep_alive": "24h",
+                "options": {"num_predict": 48, "temperature": 0.2}
+            }
+            img = sight.get("snapshot_png_base64")
+            if not img and isinstance(obs, dict):
+                img = obs.get("sight", {}).get("snapshot_png_base64")
+            if img and isinstance(img, str):
+                payload["images"] = [img]
+
             req = urllib.request.Request(
                 f"{self.ollama}/api/generate",
-                data=json.dumps({
-                    "model": self.vl_model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "keep_alive": "24h",
-                    "options": {"num_predict": 48, "temperature": 0.2}
-                }).encode(),
+                data=json.dumps(payload).encode(),
                 headers={"Content-Type": "application/json"}
             )
             with urllib.request.urlopen(req, timeout=1.0) as resp:

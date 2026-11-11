@@ -551,6 +551,78 @@ class Deliverable4And5OrchestratorEndToEndTests(unittest.TestCase):
             self.assertFalse(orch.llm_client.is_paused_for_reflex)
             orch.stop()
 
+    def test_sandbox_ast_rejects_dead_loops_and_nested_function_bypasses(self):
+        # Dead loops without cooperative yields must fail
+        code1 = "def skill():\n    while False:\n        pass\n"
+        with self.assertRaises(SandboxSecurityError):
+            validate_skill_ast(code1)
+
+        code2 = "def skill():\n    for _ in []:\n        pass\n"
+        with self.assertRaises(SandboxSecurityError):
+            validate_skill_ast(code2)
+
+        code3 = "def skill():\n    for _ in range(0):\n        pass\n"
+        with self.assertRaises(SandboxSecurityError):
+            validate_skill_ast(code3)
+
+        # Cooperative yield hidden inside a nested function must not satisfy outer loop
+        code4 = "def skill(ct):\n    while True:\n        def helper():\n            ct.ThrowIfCancellationRequested()\n"
+        with self.assertRaises(SandboxSecurityError):
+            validate_skill_ast(code4)
+
+        # Correct outer cooperative yield passes
+        code5 = "def skill(ct):\n    while True:\n        ct.ThrowIfCancellationRequested()\n"
+        validate_skill_ast(code5)
+
+    def test_sandbox_ast_bounds_comprehensions(self):
+        # Nested comprehensions deeper than depth 2 must fail
+        deep_code = "def skill():\n    x = [[[z for z in range(2)] for y in range(2)] for x in range(2)]\n"
+        with self.assertRaises(SandboxSecurityError):
+            validate_skill_ast(deep_code)
+
+        # Comprehensions with > 2 generators/clauses must fail
+        clauses_code = "def skill():\n    x = [a for a in range(2) for b in range(2) for c in range(2)]\n"
+        with self.assertRaises(SandboxSecurityError):
+            validate_skill_ast(clauses_code)
+
+        # Normal shallow comprehension passes
+        normal_code = "def skill():\n    x = [a for a in range(2)]\n"
+        validate_skill_ast(normal_code)
+
+    def test_experience_q_table_bridge(self):
+        import sqlite3
+        from experience import Experience
+        with tempfile.TemporaryDirectory() as tmp:
+            q_table = SkillQTable(Path(tmp) / "q_table.json")
+            db = sqlite3.connect(":memory:")
+            db.execute("CREATE TABLE IF NOT EXISTS decisions (id TEXT PRIMARY KEY, created REAL, action TEXT, target TEXT, goal TEXT, hypothesis TEXT, result TEXT)")
+            exp = Experience(db, q_table=q_table)
+
+            obs = {
+                "position": [10, 64, 10], "dimension": "minecraft:overworld",
+                "inventory": ["minecraft:wooden_pickaxe=1"],
+                "last_result": {"id": "act-1", "action": "mine", "target": "minecraft:diamond_ore",
+                                "status": "failed", "detail": "Diamond ore requires iron pickaxe"},
+            }
+            for i in range(6):
+                act_id = f"act-{i}"
+                db.execute("INSERT INTO decisions (id) VALUES (?)", (act_id,))
+                obs["last_result"]["id"] = act_id
+                exp.remember(act_id, obs)
+                exp.learn(act_id, "mine", "minecraft:diamond_ore", obs)
+
+            lookup, blocked = exp.context(obs)
+            self.assertTrue(len(lookup) > 0)
+            target_str = "diamond_ore"
+            sid = f"mine_{target_str}"
+            ctx_hash = hash(json.dumps(["minecraft:overworld", [0, 4, 0], ["minecraft:wooden_pickaxe"]], separators=(",", ":"))) & 0xFFFFFFFF
+            # Q-table should have recorded penalty <= -15.0 after consecutive failures
+            q_val = q_table.get_context_skill_q(ctx_hash, sid)
+            self.assertLessEqual(q_val, -15.0)
+
+            # Blocked actions should reflect low Q-value
+            self.assertTrue(any(b["action"] == "mine" and b.get("target") == "minecraft:diamond_ore" for b in blocked))
+
 
 if __name__ == "__main__":
     unittest.main()

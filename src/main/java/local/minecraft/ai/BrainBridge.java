@@ -15,6 +15,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 final class BrainBridge implements AutoCloseable {
     static final class DecisionRejectedException extends IOException {
@@ -27,9 +28,38 @@ final class BrainBridge implements AutoCloseable {
     private final String token = UUID.randomUUID().toString() + UUID.randomUUID();
     private final ExecutorService executor = Executors.newSingleThreadExecutor(Thread.ofVirtual().factory());
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
-    private Process process;
-    private boolean closed;
-    private Path portFile;
+    private volatile Process process;
+    private volatile boolean closed;
+    private volatile Path portFile;
+    private static String pythonBinary;
+
+    static synchronized String getPythonBinary() {
+        if (pythonBinary != null) return pythonBinary;
+        String env = System.getenv("LOCALAI_PYTHON");
+        if (env != null && !env.isBlank() && canRun(env)) {
+            pythonBinary = env;
+            return pythonBinary;
+        }
+        if (canRun("python3")) {
+            pythonBinary = "python3";
+            return pythonBinary;
+        }
+        if (canRun("python")) {
+            pythonBinary = "python";
+            return pythonBinary;
+        }
+        pythonBinary = "python3";
+        return pythonBinary;
+    }
+
+    private static boolean canRun(String binary) {
+        try {
+            Process p = new ProcessBuilder(binary, "--version").start();
+            return p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS) && p.exitValue() == 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
 
     BrainBridge(Path script, Path directory, String model) {
         this(script, directory, model, "{}");
@@ -88,31 +118,89 @@ final class BrainBridge implements AutoCloseable {
         }
     }
 
+    private synchronized void cleanupStartupFailure() {
+        if (process != null) {
+            process.destroy();
+            try {
+                if (!process.waitFor(1, java.util.concurrent.TimeUnit.SECONDS)) process.destroyForcibly();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                process.destroyForcibly();
+            }
+            process = null;
+        }
+        cleanupStalePortFiles();
+    }
+
+    private void cleanupStalePortFiles() {
+        try {
+            if (portFile != null) {
+                Files.deleteIfExists(portFile);
+                portFile = null;
+            }
+            if (Files.isDirectory(directory)) {
+                try (var stream = Files.newDirectoryStream(directory, "port-*.txt")) {
+                    for (Path p : stream) {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (IOException ignored) {}
+                    }
+                }
+            }
+        } catch (IOException ignored) {}
+    }
+
     private synchronized Path ensureRunning() throws IOException {
         if (closed) throw new IOException("Brain bridge is closed");
         if (process != null && process.isAlive()) return portFile;
         if (process != null) LocalAiMod.LOG.error("Brain process exited with code {}; restarting", process.exitValue());
         if (!OllamaService.get().ensureRunning()) LocalAiMod.LOG.warn("Ollama is not answering; Willow's brain will retry");
-        Files.createDirectories(directory);
-        portFile = directory.resolve("port-" + UUID.randomUUID() + ".txt");
-        ProcessBuilder builder = new ProcessBuilder("python3", script.toString(),
-                "--database", directory.resolve("brain.sqlite3").toString(),
-                "--port-file", portFile.toString(), "--model", model, "--settings", settings);
-        builder.environment().put("LOCALAI_TOKEN", token);
-        builder.redirectErrorStream(true);
-        builder.redirectOutput(directory.resolve("brain-startup.log").toFile());
-        process = builder.start();
-        return portFile;
+        try {
+            cleanupStalePortFiles();
+            Files.createDirectories(directory);
+            portFile = directory.resolve("port-" + UUID.randomUUID() + ".txt");
+            ProcessBuilder builder = new ProcessBuilder(getPythonBinary(), script.toString(),
+                    "--database", directory.resolve("brain.sqlite3").toString(),
+                    "--port-file", portFile.toString(), "--model", model, "--settings", settings);
+            builder.environment().put("LOCALAI_TOKEN", token);
+            builder.redirectErrorStream(true);
+            builder.redirectOutput(directory.resolve("brain-startup.log").toFile());
+            process = builder.start();
+            return portFile;
+        } catch (Exception e) {
+            cleanupStartupFailure();
+            throw e;
+        }
     }
 
     CompletableFuture<JsonObject> decide(JsonObject observation) {
-        String body = observation.toString();
         return CompletableFuture.supplyAsync(() -> {
             try {
+                CompletableFuture<String> snapFuture = SightPerception.getPendingSnapshot();
+                if (snapFuture != null) {
+                    try {
+                        String b64 = snapFuture.get(100, TimeUnit.MILLISECONDS);
+                        if (b64 != null && observation.has("sight") && observation.get("sight").isJsonObject()) {
+                            observation.getAsJsonObject("sight").addProperty("snapshot_png_base64", b64);
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+                String body = observation.toString();
                 Path file = ensureRunning();
                 for (int i = 0; !Files.exists(file) && i < 100; i++) {
                     if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
+                    if (process != null && !process.isAlive()) {
+                        cleanupStartupFailure();
+                        throw new IOException("Brain process exited with code " + process.exitValue()
+                                + " during startup. See " + directory.resolve("brain-startup.log"));
+                    }
                     Thread.sleep(50);
+                }
+                if (!Files.exists(file)) {
+                    cleanupStartupFailure();
+                    throw new IOException("Brain failed to create port file within 5 seconds. See "
+                            + directory.resolve("brain-startup.log"));
                 }
                 int port = Integer.parseInt(Files.readString(file).trim());
                 HttpRequest request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/decide"))
@@ -162,13 +250,8 @@ final class BrainBridge implements AutoCloseable {
                 Thread.currentThread().interrupt();
                 process.destroyForcibly();
             }
+            process = null;
         }
-        if (portFile != null) {
-            try {
-                Files.deleteIfExists(portFile);
-            } catch (IOException e) {
-                LocalAiMod.LOG.warn("Could not remove brain port file {}", portFile, e);
-            }
-        }
+        cleanupStalePortFiles();
     }
 }

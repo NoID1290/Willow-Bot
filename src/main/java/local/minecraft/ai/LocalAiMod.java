@@ -51,17 +51,17 @@ public final class LocalAiMod implements ModInitializer {
     private volatile MinecraftServer server;
     private ServerPlayer player;
     private Actions actions;
-    private BrainBridge bridge;
+    private volatile BrainBridge bridge;
     private CompletableFuture<JsonObject> pending;
     private final List<String> chat = new ArrayList<>();
     private int sentChat;
     private long nextThink;
     private int failures;
     private int rejectedPlans;
-    private boolean paused;
+    private volatile boolean paused;
     private boolean discardPending;
     private boolean died;
-    private String status = "Not in a world";
+    private volatile String status = "Not in a world";
     private volatile boolean selectingModel;
     private volatile long selectionRequest;
     private volatile String selectedModel = "gemma4:12b-it-qat";
@@ -98,29 +98,40 @@ public final class LocalAiMod implements ModInitializer {
             if (entity == player) {
                 died = true;
                 discardPending = pending != null;
+                if (pending != null) pending.cancel(true);
                 if (actions != null) actions.stop("Died from " + damageSource.getMsgId(), true);
             }
         });
         ServerMessageEvents.CHAT_MESSAGE.register((message, sender, params) -> {
-            if (player == null || bridge == null || paused) return;
-            String text = message.signedContent();
-            if (text == null || text.isBlank()) return;
-            String lower = text.toLowerCase();
-            if (lower.contains("willow") || lower.contains("@willow")) {
-                queueChatMessage(text, sender.getGameProfile().name(), null);
+            MinecraftServer s = server;
+            if (s != null) {
+                s.execute(() -> {
+                    if (player == null || bridge == null || paused) return;
+                    String text = message.signedContent();
+                    if (text == null || text.isBlank()) return;
+                    String lower = text.toLowerCase();
+                    if (lower.contains("willow") || lower.contains("@willow")) {
+                        queueChatMessage(text, sender.getGameProfile().name(), null);
+                    }
+                });
             }
         });
         ServerMessageEvents.COMMAND_MESSAGE.register((message, source, params) -> {
-            if (player == null || bridge == null || paused) return;
-            String text = message.signedContent();
-            if (text == null || text.isBlank()) return;
-            String senderName = source.getTextName();
-            if (NAME.equalsIgnoreCase(senderName)) return;
-            if (params.targetName().isPresent()) {
-                String target = params.targetName().get().getString();
-                if (!NAME.equalsIgnoreCase(target)) return;
+            MinecraftServer s = server;
+            if (s != null) {
+                s.execute(() -> {
+                    if (player == null || bridge == null || paused) return;
+                    String text = message.signedContent();
+                    if (text == null || text.isBlank()) return;
+                    String senderName = source.getTextName();
+                    if (NAME.equalsIgnoreCase(senderName)) return;
+                    if (params.targetName().isPresent()) {
+                        String target = params.targetName().get().getString();
+                        if (!NAME.equalsIgnoreCase(target)) return;
+                    }
+                    queueChatMessage(text, senderName, null);
+                });
             }
-            queueChatMessage(text, senderName, null);
         });
         CommandRegistrationCallback.EVENT.register((dispatcher, registry, environment) -> {
                 dispatcher.register(Commands.literal("brain")
@@ -134,6 +145,7 @@ public final class LocalAiMod implements ModInitializer {
                         .then(Commands.literal("pause").executes(context -> {
                             paused = true;
                             discardPending = true;
+                            if (pending != null) pending.cancel(true);
                             if (actions != null) actions.stop("Paused by player");
                             status = "Willow paused; /brain resume to continue";
                             context.getSource().sendSuccess(() -> Component.literal(status), false);
@@ -251,6 +263,7 @@ public final class LocalAiMod implements ModInitializer {
         }
         if (pending != null) {
             discardPending = true;
+            pending.cancel(true);
             LOG.info("Discarding pending pre-chat plan to process player message immediately");
         }
         return true;
@@ -603,6 +616,7 @@ public final class LocalAiMod implements ModInitializer {
                 actions.stop("Player died", true);
                 JsonObject deathResult = actions.result();
                 discardPending = true;
+                if (pending != null) pending.cancel(true);
                 ServerPlayer connected = server.getPlayerList().getPlayer(PLAYER_ID);
                 if (connected != null) return;
                 var destination = died ? player.findRespawnPositionAndUseSpawnBlock(false,
@@ -621,6 +635,7 @@ public final class LocalAiMod implements ModInitializer {
             // 20 Hz Fast Reactive Survival Reflex Loop (runs every 50ms server tick; 0% GPU/LLM usage)
             if (actions.reflex20Hz()) {
                 discardPending = pending != null;
+                if (discardPending && pending != null) pending.cancel(true);
             }
             actions.tick();
             if (player.isUsingItem() && !actions.busy()) return;
@@ -713,7 +728,8 @@ public final class LocalAiMod implements ModInitializer {
         if (pending != null) pending.cancel(true);
         if (bridge != null) bridge.close();
         // Always unload the active model from VRAM/RAM when stopping or closing
-        Thread.startVirtualThread(() -> OllamaService.get().unloadAll());
+        String activeModelToUnload = selectedModel;
+        Thread.startVirtualThread(() -> OllamaService.get().unloadAll(activeModelToUnload));
         if (player != null && server != null && server.getPlayerList().getPlayer(PLAYER_ID) == player) {
             player.stopRiding();
             player.ejectPassengers();

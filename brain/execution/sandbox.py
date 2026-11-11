@@ -120,16 +120,58 @@ class SandboxExecutionOutcome:
     duration_ms: int
 
 
+def _is_dead_loop(node: ast.AST) -> bool:
+    """Returns True if a loop's condition or iterable is statically empty/dead."""
+    if isinstance(node, ast.While):
+        if isinstance(node.test, ast.Constant) and not node.test.value:
+            return True
+    elif isinstance(node, (ast.For, ast.AsyncFor)):
+        # Empty collection literals
+        if isinstance(node.iter, (ast.List, ast.Tuple, ast.Set)) and len(node.iter.elts) == 0:
+            return True
+        if isinstance(node.iter, ast.Dict) and len(node.iter.keys) == 0:
+            return True
+        if isinstance(node.iter, ast.Constant) and not node.iter.value:
+            return True
+        # range(0) or range(start, stop) where start >= stop
+        if isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name) and node.iter.func.id == "range":
+            args = node.iter.args
+            if len(args) == 1 and isinstance(args[0], ast.Constant) and isinstance(args[0].value, int) and args[0].value <= 0:
+                return True
+            if len(args) == 2 and isinstance(args[0], ast.Constant) and isinstance(args[1], ast.Constant):
+                if isinstance(args[0].value, int) and isinstance(args[1].value, int) and args[0].value >= args[1].value:
+                    return True
+    return False
+
+
 def _loop_contains_cooperative_yield(loop_node: ast.For | ast.While | ast.AsyncFor) -> bool:
     """Checks that a loop directly contains an `await` or `ct.ThrowIfCancellationRequested()` check."""
-    for child in ast.walk(loop_node):
-        if child is loop_node:
+    if _is_dead_loop(loop_node):
+        return False
+
+    # Traverse child nodes without recursing into nested function definitions or dead loops
+    stack: list[ast.AST] = []
+    stack.extend(loop_node.body)
+    stack.extend(loop_node.orelse)
+
+    while stack:
+        child = stack.pop()
+        # Do not recurse into nested function, async function, or lambda definitions
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
             continue
+        # Do not recurse into nested dead loops
+        if _is_dead_loop(child):
+            continue
+
         if isinstance(child, ast.Await):
             return True
         if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
             if child.func.attr in ("ThrowIfCancellationRequested", "throw_if_cancellation_requested"):
                 return True
+
+        for next_child in ast.iter_child_nodes(child):
+            stack.append(next_child)
+
     return False
 
 
@@ -200,6 +242,25 @@ def validate_skill_ast(source_code: str) -> tuple[ast.Module, str]:
                 raise SandboxSecurityError(
                     "Unbounded synchronous loop without `await` or `ct.ThrowIfCancellationRequested()` is forbidden."
                 )
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            if len(node.generators) > 2:
+                raise SandboxSecurityError("Comprehension exceeds maximum clause depth (max 2).")
+
+            def _comp_depth(comp_node: ast.AST, depth: int) -> int:
+                max_d = depth
+                for child in ast.iter_child_nodes(comp_node):
+                    if isinstance(child, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                        d = _comp_depth(child, depth + 1)
+                        if d > max_d:
+                            max_d = d
+                    else:
+                        d = _comp_depth(child, depth)
+                        if d > max_d:
+                            max_d = d
+                return max_d
+
+            if _comp_depth(node, 1) > 2:
+                raise SandboxSecurityError("Nested comprehension depth exceeds safety limit (max 2).")
         elif isinstance(node, (ast.Global, ast.Nonlocal, ast.ClassDef)):
             raise SandboxSecurityError(f"Unsupported statement '{type(node).__name__}' in skill sandbox.")
 
@@ -243,6 +304,7 @@ class ScriptSandbox:
             "ActionResult": ActionResult,
             "Vector3": Vector3,
             "CombatTactic": CombatTactic,
+            "ct": NONE_TOKEN,
         }
         isolated_scope.update(self._global_skills)
 
@@ -285,15 +347,26 @@ class ScriptSandbox:
                 duration_ms=dur_ms,
             )
 
+        # Inject ct and bot into isolated execution scope
+        fn_globals = getattr(fn, "__globals__", None)
+        if isinstance(fn_globals, dict):
+            fn_globals["ct"] = token
+            fn_globals["bot"] = bot
+
         eff_timeout_sec = (timeout_ms if timeout_ms is not None else self.default_timeout_ms) / 1000.0
         try:
             token.throw_if_cancellation_requested()
             sig = inspect.signature(fn)
-            arity = len(sig.parameters)
+            params = list(sig.parameters.values())
+            arity = len(params)
             if arity == 0:
                 call_res = fn()
             elif arity == 1:
-                call_res = fn(bot)
+                pname = params[0].name.lower()
+                if pname in ("ct", "token", "cancellation_token"):
+                    call_res = fn(token)
+                else:
+                    call_res = fn(bot)
             else:
                 call_res = fn(bot, token)
 

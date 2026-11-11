@@ -39,6 +39,30 @@ def _has_fuel(state: BotTelemetrySnapshot) -> bool:
     )
 
 
+TASK_PRECONDITIONS: dict[str, dict[str, int]] = {
+    "t1_gather_logs": {},
+    "t1_craft_planks_sticks": {"*_log": 3},
+    "t1_craft_table": {"*_planks": 4},
+    "t1_wooden_pickaxe": {"crafting_table_nearby": 1, "*_planks": 3, "stick": 2},
+    "t2_mine_cobblestone": {"wooden_pickaxe": 1},
+    "t2_stone_tools": {"crafting_table_nearby": 1, "cobblestone": 11, "stick": 6},
+    "t2_acquire_raw_food": {"stone_sword": 1},
+    "t2_furnace_and_fuel": {"crafting_table_nearby": 1, "cobblestone": 8},
+    "t2_cook_food_and_torches": {"furnace_nearby": 1, "torch": 4},
+    "t2_survive_night_or_bed": {"torch": 4},
+    "t3_mine_iron_ore": {"stone_pickaxe": 1, "torch": 8},
+    "t3_smelt_iron_ingots": {"furnace_nearby": 1, "raw_iron": 1},
+    "t3_shield_and_water_bucket": {"crafting_table_nearby": 1, "iron_ingot": 4, "*_planks": 6},
+    "t3_iron_tools_and_armor": {"crafting_table_nearby": 1, "iron_ingot": 13, "stick": 4},
+    "t3_slay_hostile_mob": {"iron_sword": 1, "shield": 1},
+    "t4_deep_mining_prep": {"iron_pickaxe": 2, "torch": 32},
+    "t4_mine_diamonds": {"iron_pickaxe": 1, "water_bucket": 1},
+    "t4_craft_diamond_gear": {"crafting_table_nearby": 1, "diamond": 5, "stick": 4},
+    "t4_harvest_obsidian": {"diamond_pickaxe": 1, "water_bucket": 1},
+    "t5_enter_the_nether": {"obsidian": 10, "flint_and_steel": 1},
+}
+
+
 PRECONDITION_PREDICATES: dict[str, Callable[[BotTelemetrySnapshot], bool]] = {
     "t1_gather_logs": lambda s: True,
     "t1_craft_planks_sticks": lambda s: s.count_item("*_log") >= 3 or (s.count_item("*_planks") >= 8 and s.count_item("stick") >= 4),
@@ -130,6 +154,10 @@ class CurriculumNode:
     def verification_description(self) -> str:
         return self.verification_expr
 
+    @property
+    def preconditions(self) -> dict[str, int]:
+        return dict(TASK_PRECONDITIONS.get(self.id, {}))
+
     def check_preconditions(self, state: BotTelemetrySnapshot) -> bool:
         if self._precondition_fn is not None:
             return bool(self._precondition_fn(state))
@@ -214,23 +242,31 @@ class CurriculumDAG:
         visiting: set[str] = set()
         order: list[str] = []
 
-        def dfs(nid: str) -> None:
-            if nid in visited:
-                return
-            if nid in visiting:
-                raise ValueError(f"Cycle detected in CurriculumDAG involving '{nid}'")
-            visiting.add(nid)
-            node = self._nodes[nid]
-            for prereq in node.prerequisites:
-                if prereq not in self._nodes:
-                    raise KeyError(f"Unknown prerequisite '{prereq}' on node '{nid}'")
-                dfs(prereq)
-            visiting.remove(nid)
-            visited.add(nid)
-            order.append(nid)
+        for start_id in self._nodes:
+            if start_id in visited:
+                continue
+            stack: list[tuple[str, Any]] = [(start_id, iter(self._nodes[start_id].prerequisites))]
+            visiting.add(start_id)
 
-        for nid in self._nodes:
-            dfs(nid)
+            while stack:
+                curr_id, prereqs_iter = stack[-1]
+                advanced = False
+                for prereq in prereqs_iter:
+                    if prereq not in self._nodes:
+                        raise KeyError(f"Unknown prerequisite '{prereq}' on node '{curr_id}'")
+                    if prereq in visiting:
+                        raise ValueError(f"Cycle detected in CurriculumDAG involving '{prereq}'")
+                    if prereq not in visited:
+                        visiting.add(prereq)
+                        stack.append((prereq, iter(self._nodes[prereq].prerequisites)))
+                        advanced = True
+                        break
+                if not advanced:
+                    visiting.remove(curr_id)
+                    visited.add(curr_id)
+                    order.append(curr_id)
+                    stack.pop()
+
         return order
 
     @property

@@ -181,12 +181,26 @@ class WillowBotActions:
     async def _dispatch_if_live(self, step: dict[str, Any], ct: CancellationToken) -> ActionResult | None:
         if self._command_executor is None:
             return None
-        res = await self._command_executor(step, ct)
-        if self._state_provider is not None:
-            self._sync_from_snapshot(self._state_provider())
-        return res
+        try:
+            res = await self._command_executor(step, ct)
+            if self._state_provider is not None:
+                self._sync_from_snapshot(self._state_provider())
+            return res
+        except OperationCanceledError:
+            raise
+        except Exception as exc:
+            err_msg = f"{type(exc).__name__}: {exc}"
+            self._recorder.record_exception(err_msg)
+            raise
 
     def _sync_from_snapshot(self, snap: BotTelemetrySnapshot) -> None:
+        prev_mh = self._equipment.get(EquipmentSlot.MAIN_HAND)
+        if prev_mh and prev_mh.item_id and prev_mh.item_id != "minecraft:air":
+            new_mh = snap.equipment.get(EquipmentSlot.MAIN_HAND)
+            if (not new_mh or new_mh.item_id == "minecraft:air" or new_mh.current_durability <= 0):
+                if snap.count_item(prev_mh.item_id) < self.GetItemCount(prev_mh.item_id):
+                    self._recorder.record_broken_tool(prev_mh.item_id)
+
         self._pos = snap.position
         self._dimension = snap.dimension
         self._biome = snap.biome

@@ -265,6 +265,52 @@ public final class LocalAiGameTests {
     }
 
     @GameTest
+    public void craftingCacheValidation(GameTestHelper helper) {
+        ServerPlayer bot = LocalAiMod.spawn(helper.getLevel().getServer());
+        Crafting.invalidateCache();
+        var first = Crafting.available(bot);
+        var second = Crafting.available(bot);
+        helper.assertTrue(first == second, "Consecutive Crafting.available calls must return identical cached list reference");
+        Crafting.invalidateCache();
+        var third = Crafting.available(bot);
+        helper.assertTrue(first != third, "Crafting.invalidateCache must force recreation of available recipes list");
+        helper.getLevel().getServer().getPlayerList().remove(bot);
+        helper.succeed();
+    }
+
+    @GameTest
+    public void willowViewDirtyCheck(GameTestHelper helper) {
+        ServerPlayer bot = LocalAiMod.spawn(helper.getLevel().getServer());
+        WillowView.clear();
+        WillowView.capture(bot);
+        var first = WillowView.current();
+        helper.assertTrue(first != null, "WillowView.capture must populate snapshot");
+        WillowView.capture(bot);
+        var second = WillowView.current();
+        helper.assertTrue(first == second, "Unchanged player state must reuse previous snapshot reference");
+        WillowView.clear();
+        helper.assertTrue(WillowView.current() == null, "WillowView.clear must null snapshot");
+        helper.getLevel().getServer().getPlayerList().remove(bot);
+        helper.succeed();
+    }
+
+    @GameTest
+    public void unifiedWorkstationScan(GameTestHelper helper) {
+        helper.setBlock(2, 2, 2, Blocks.CRAFTING_TABLE);
+        ServerPlayer bot = LocalAiMod.spawn(helper.getLevel().getServer());
+        BlockPos start = helper.absolutePos(new BlockPos(1, 2, 2));
+        bot.teleportTo(helper.getLevel(), start.getX() + 0.5, start.getY(), start.getZ() + 0.5,
+                Set.of(), 0, 0, true);
+        Actions actions = new Actions(bot);
+        var obs = actions.observe(java.util.List.of());
+        helper.assertTrue(obs.has("nearby_workstations"), "Observation must include nearby_workstations");
+        var ws = obs.getAsJsonObject("nearby_workstations");
+        helper.assertTrue(ws.has("crafting_table"), "Nearby crafting table must be scanned and registered in workstations: " + ws);
+        helper.getLevel().getServer().getPlayerList().remove(bot);
+        helper.succeed();
+    }
+
+    @GameTest
     public void layeredTerrain(GameTestHelper helper) {
         for (int x = 1; x <= 5; x++) helper.setBlock(x, 1, 2, Blocks.STONE);
         helper.setBlock(2, 2, 2, Blocks.SNOW.defaultBlockState()

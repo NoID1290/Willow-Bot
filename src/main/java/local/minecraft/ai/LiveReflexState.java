@@ -41,12 +41,26 @@ final class LiveReflexState {
     boolean combatOrFleeActive = false;
     String activeHazard = "NONE";
     private int shieldHoldTicks = 0;
+    private boolean reflexWaterPlaced = false;
 
     boolean tick20Hz(ServerPlayer player, Actions actions) {
         if (player == null || !player.isAlive() || player.isRemoved()) {
             combatOrFleeActive = false;
             activeHazard = "NONE";
+            reflexWaterPlaced = false;
             return false;
+        }
+
+        EntityPlayerActionPack pack = ((ServerPlayerInterface) player).getActionPack();
+        if (reflexWaterPlaced && player.onGround()) {
+            int bucketSlot = findItemSlot(player, Items.BUCKET);
+            if (bucketSlot >= 0) {
+                actions.selectHotbarOrSwap(bucketSlot);
+                player.setXRot(90.0f);
+                pack.look(player.getYRot(), 90.0f);
+                player.getMainHandItem().use(player.level(), player, InteractionHand.MAIN_HAND);
+            }
+            reflexWaterPlaced = false;
         }
 
         // Update primitive fields in-place (zero heap allocations)
@@ -115,7 +129,6 @@ final class LiveReflexState {
             }
         }
 
-        EntityPlayerActionPack pack = ((ServerPlayerInterface) player).getActionPack();
         if (shieldHoldTicks > 0) {
             shieldHoldTicks--;
             if (shieldHoldTicks == 0 && player.isUsingItem() && player.getUseItem().is(Items.SHIELD)) {
@@ -126,13 +139,25 @@ final class LiveReflexState {
         // 1. Water-bucket MLG (>3m fall) or fire/lava extinguish
         if ((this.fallDistance > 3.0 && !player.onGround() && !player.isInWater())
                 || this.inLava || this.fireTicks > 0) {
-            int waterSlot = findItemSlot(player, Items.WATER_BUCKET);
-            if (waterSlot >= 0) {
-                actions.stop("Reflex: water bucket MLG / fire extinguish");
-                actions.selectHotbarOrSwap(waterSlot);
-                pack.look(player.getYRot(), 90.0f);
-                player.getMainHandItem().use(player.level(), player, InteractionHand.MAIN_HAND);
-                return markInterrupt("WATER_MLG_OR_FIRE");
+            boolean ultraWarm = Boolean.TRUE.equals(player.level().environmentAttributes()
+                    .getDimensionValue(net.minecraft.world.attribute.EnvironmentAttributes.WATER_EVAPORATES));
+            if (!ultraWarm && !player.isEyeInFluid(net.minecraft.tags.FluidTags.LAVA)) {
+                Vec3 start = player.position();
+                Vec3 end = start.add(0, -4.5, 0);
+                var hit = player.level().clip(new net.minecraft.world.level.ClipContext(start, end,
+                        net.minecraft.world.level.ClipContext.Block.COLLIDER, net.minecraft.world.level.ClipContext.Fluid.NONE, player));
+                if (hit.getType() == net.minecraft.world.phys.HitResult.Type.BLOCK) {
+                    int waterSlot = findItemSlot(player, Items.WATER_BUCKET);
+                    if (waterSlot >= 0) {
+                        actions.stop("Reflex: water bucket MLG / fire extinguish");
+                        actions.selectHotbarOrSwap(waterSlot);
+                        player.setXRot(90.0f);
+                        pack.look(player.getYRot(), 90.0f);
+                        player.getMainHandItem().use(player.level(), player, InteractionHand.MAIN_HAND);
+                        reflexWaterPlaced = true;
+                        return markInterrupt("WATER_MLG_OR_FIRE");
+                    }
+                }
             }
             if (this.inLava || this.lavaWithin2Blocks) {
                 pack.start(EntityPlayerActionPack.ActionType.JUMP, EntityPlayerActionPack.Action.once());
@@ -222,6 +247,8 @@ final class LiveReflexState {
         if (this.combatOrFleeActive) {
             this.combatOrFleeActive = false;
             this.activeHazard = "NONE";
+            pack.stopMovement();
+            pack.setSprinting(false);
             LocalAiMod.LOG.info("[REFLEX-INTERRUPT] Hazard cleared; resuming cognitive planning.");
         }
         return false;

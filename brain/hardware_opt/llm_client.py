@@ -114,8 +114,9 @@ class CancellationTokenSource:
 
 
 class InferencePriority(IntEnum):
-    """Priority ordering for single-flight LLM semaphore: SkillMutation > NewSkillSynthesis > TaskDecomposition."""
+    """Priority ordering for single-flight LLM semaphore: ReflexDecision/SkillMutation > NewSkillSynthesis > TaskDecomposition."""
 
+    REFLEX_DECISION = 0
     SKILL_MUTATION = 0
     NEW_SKILL_SYNTHESIS = 1
     TASK_DECOMPOSITION = 2
@@ -189,6 +190,27 @@ class LocalInferenceOptimizer:
             "num_batch": self.num_batch,
             "num_thread": self.num_thread,
         }
+
+    def align_with_profile(self, profile: dict[str, Any] | None, keep_alive: str | None = None) -> None:
+        """Aligns num_ctx, num_thread, keep_alive and inference options with Brain.profile."""
+        if keep_alive is not None:
+            self.keep_alive = str(keep_alive)
+        if not profile or not isinstance(profile, dict):
+            return
+        opts = profile.get("options") if isinstance(profile.get("options"), dict) else profile
+        if isinstance(opts, dict):
+            if "num_ctx" in opts:
+                self.num_ctx = int(opts["num_ctx"])
+            if "num_thread" in opts:
+                self.num_thread = int(opts["num_thread"])
+            if "num_predict" in opts:
+                self.num_predict = int(opts["num_predict"])
+            if "temperature" in opts:
+                self.temperature = float(opts["temperature"])
+            if "top_p" in opts:
+                self.top_p = float(opts["top_p"])
+            if "keep_alive" in opts:
+                self.keep_alive = str(opts["keep_alive"])
 
     def build_options(
         self,
@@ -375,6 +397,10 @@ class LocalLlmClient:
         self._last_ttft_ms = 0.0
         self._last_static_prefix_hash: int | None = None
         self._prefix_cache_hits = 0
+
+    @property
+    def gate(self) -> _PriorityGate:
+        return self._gate
 
     @property
     def is_paused_for_reflex(self) -> bool:

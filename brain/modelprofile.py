@@ -7,6 +7,7 @@ Run directly to print a profile as JSON (used by the in-game settings screen):
 
 import argparse
 import ctypes
+import functools
 import json
 import math
 import os
@@ -141,6 +142,7 @@ def _round_tokens(value, low=256, high=16384, step=64):
     return max(low, min(high, ((clamped + step // 2) // step) * step))
 
 
+@functools.lru_cache(maxsize=1)
 def detect_hardware():
     """Detect real CPU, RAM, storage, and GPU VRAM using NVML ctypes with CLI/sysfs fallbacks."""
     hw = {
@@ -440,7 +442,8 @@ def derive_gameplay_limits(
     if not hw_mode:
         return dict(GAMEPLAY_LIMITS)
     max_out_tokens = max(int(actor_tokens or 512), int(plan_tokens or 1024))
-    bpt = max(2.5, float(bytes_per_token or BYTES_PER_TOKEN))
+    bpt_val = bytes_per_token if (bytes_per_token is not None and bytes_per_token > 0) else BYTES_PER_TOKEN
+    bpt = max(2.5, float(bpt_val))
     # HTTP response limit: 4x max output bytes + 64 KiB Ollama JSON metadata envelope, rounded to 32 KiB
     raw_resp = int(max_out_tokens * bpt * 4.0) + 65536
     response_limit_bytes = max(65536, min(262144, ((raw_resp + 32767) // 32768) * 32768))
@@ -670,7 +673,13 @@ def build(model, show, settings=None, hardware=None, benchmark=None):
 
     measured_prompt_tps = float(bench.get("prompt_tps") or (960.0 if "12b" in model.lower() else 1800.0))
     measured_gen_tps = float(bench.get("gen_tps") or (48.5 if "12b" in model.lower() else (230.0 if is_lfm else 85.0)))
-    measured_bpt = float(bench.get("bytes_per_token") or (BYTES_PER_TOKEN))
+    raw_bpt = bench.get("bytes_per_token")
+    try:
+        measured_bpt = float(raw_bpt) if raw_bpt is not None else BYTES_PER_TOKEN
+    except (ValueError, TypeError):
+        measured_bpt = BYTES_PER_TOKEN
+    if measured_bpt <= 0:
+        measured_bpt = BYTES_PER_TOKEN
     measured_bpt = max(2.5, min(5.5, measured_bpt))
     sources["bytes_per_token"] = "measured_ollama_eval" if "bytes_per_token" in bench else "default_3.5"
     sources["throughput"] = "measured_benchmark" if "gen_tps" in bench else "architecture_estimate"
@@ -1102,6 +1111,8 @@ def benchmark_model(model, ollama="http://127.0.0.1:11434", show=None, context=1
         prompt_tps = (p_tok / (p_dur / 1e9)) if (p_tok > 0 and p_dur > 0) else 960.0
         gen_tps = (g_tok / (g_dur / 1e9)) if (g_tok > 0 and g_dur > 0) else 48.5
         bpt = (prompt_byte_len / p_tok) if p_tok > 20 else BYTES_PER_TOKEN
+        if bpt <= 0:
+            bpt = BYTES_PER_TOKEN
         _, live_ps_vram, _ = fetch_model_weights_mib(model, show=show, ollama=ollama, timeout=2)
         return {
             "prompt_tps": round(prompt_tps, 1),

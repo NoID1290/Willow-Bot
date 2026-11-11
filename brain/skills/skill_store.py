@@ -184,7 +184,7 @@ class SkillRecord:
             else:
                 have = state.count_item(pat)
                 scores.append(min(1.0, have / float(max(1, req))))
-        return sum(scores) / len(scores)
+        return (sum(scores) / len(scores)) if scores else 1.0
 
     def preconditions_satisfied(self, state: BotTelemetrySnapshot) -> bool:
         return self.precondition_match_ratio(state) >= 0.999
@@ -301,15 +301,18 @@ class SkillStore:
             f.write(raw_bytes)
 
     def _read_embedding_vector(self, index: int) -> array:
-        if not self.embeddings_path.is_file():
-            return array("f", [0.0] * EMBEDDING_DIM)
-        size = self.embeddings_path.stat().st_size
-        offset = index * BYTES_PER_VECTOR
-        if offset + BYTES_PER_VECTOR > size:
-            return array("f", [0.0] * EMBEDDING_DIM)
-        with self.embeddings_path.open("rb") as f:
-            with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ) as mm:
-                chunk = mm[offset : offset + BYTES_PER_VECTOR]
+        with self._lock:
+            if not self.embeddings_path.is_file():
+                return array("f", [0.0] * EMBEDDING_DIM)
+            size = self.embeddings_path.stat().st_size
+            offset = index * BYTES_PER_VECTOR
+            if offset + BYTES_PER_VECTOR > size or size == 0:
+                return array("f", [0.0] * EMBEDDING_DIM)
+            with self.embeddings_path.open("rb") as f:
+                f.seek(offset)
+                chunk = f.read(BYTES_PER_VECTOR)
+                if len(chunk) < BYTES_PER_VECTOR:
+                    return array("f", [0.0] * EMBEDDING_DIM)
                 out = array("f")
                 out.frombytes(chunk)
                 return out
