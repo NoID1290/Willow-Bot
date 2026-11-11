@@ -567,7 +567,11 @@ public final class LocalAiMod implements ModInitializer {
             throw new IllegalStateException(profile.name() + " already exists; refusing to take over another player");
         }
         var level = server.overworld();
-        var info = ClientInformation.createDefault();
+        var defaults = ClientInformation.createDefault();
+        int viewDist = Math.max(10, server.getPlayerList().getViewDistance());
+        var info = new ClientInformation(defaults.language(), viewDist, defaults.chatVisibility(),
+                defaults.chatColors(), defaults.modelCustomisation(), defaults.mainHand(),
+                defaults.textFilteringEnabled(), defaults.allowsListing(), defaults.particleStatus());
         var bot = EntityPlayerMPFake.respawnFake(server, level, profile, info);
         var saved = server.getPlayerList().loadPlayerData(bot.nameAndId());
         if (saved.isPresent()) {

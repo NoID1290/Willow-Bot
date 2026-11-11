@@ -32,6 +32,20 @@ final class ProgressTracker {
         if (recent.stream().allMatch(pos -> pos.distSqr(origin) <= 25)) {
             return "Eight actions without resource progress, circling within five blocks";
         }
+        int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
+        int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
+        int minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
+        for (BlockPos pos : recent) {
+            minX = Math.min(minX, pos.getX());
+            maxX = Math.max(maxX, pos.getX());
+            minY = Math.min(minY, pos.getY());
+            maxY = Math.max(maxY, pos.getY());
+            minZ = Math.min(minZ, pos.getZ());
+            maxZ = Math.max(maxZ, pos.getZ());
+        }
+        if (maxX - minX <= 12 && maxZ - minZ <= 12 && maxY - minY <= 6) {
+            return "Eight actions without resource progress, oscillating in the same small area";
+        }
         return "";
     }
 

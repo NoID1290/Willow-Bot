@@ -266,7 +266,8 @@ public final class LocalAiGameTests {
 
     @GameTest
     public void craftingCacheValidation(GameTestHelper helper) {
-        ServerPlayer bot = LocalAiMod.spawn(helper.getLevel().getServer());
+        ServerPlayer bot = LocalAiMod.spawn(helper.getLevel().getServer(), new com.mojang.authlib.GameProfile(
+                java.util.UUID.nameUUIDFromBytes("Willow_Craft_Test".getBytes()), "Willow_Craft"));
         Crafting.invalidateCache();
         var first = Crafting.available(bot);
         var second = Crafting.available(bot);
@@ -280,7 +281,8 @@ public final class LocalAiGameTests {
 
     @GameTest
     public void willowViewDirtyCheck(GameTestHelper helper) {
-        ServerPlayer bot = LocalAiMod.spawn(helper.getLevel().getServer());
+        ServerPlayer bot = LocalAiMod.spawn(helper.getLevel().getServer(), new com.mojang.authlib.GameProfile(
+                java.util.UUID.nameUUIDFromBytes("Willow_View_Test".getBytes()), "Willow_View"));
         WillowView.clear();
         WillowView.capture(bot);
         var first = WillowView.current();
@@ -297,7 +299,8 @@ public final class LocalAiGameTests {
     @GameTest
     public void unifiedWorkstationScan(GameTestHelper helper) {
         helper.setBlock(2, 2, 2, Blocks.CRAFTING_TABLE);
-        ServerPlayer bot = LocalAiMod.spawn(helper.getLevel().getServer());
+        ServerPlayer bot = LocalAiMod.spawn(helper.getLevel().getServer(), new com.mojang.authlib.GameProfile(
+                java.util.UUID.nameUUIDFromBytes("Willow_Scan_Test".getBytes()), "Willow_Scan"));
         BlockPos start = helper.absolutePos(new BlockPos(1, 2, 2));
         bot.teleportTo(helper.getLevel(), start.getX() + 0.5, start.getY(), start.getZ() + 0.5,
                 Set.of(), 0, 0, true);
@@ -306,22 +309,53 @@ public final class LocalAiGameTests {
         helper.assertTrue(obs.has("nearby_workstations"), "Observation must include nearby_workstations");
         var ws = obs.getAsJsonObject("nearby_workstations");
         helper.assertTrue(ws.has("crafting_table"), "Nearby crafting table must be scanned and registered in workstations: " + ws);
+        var sight = obs.getAsJsonObject("sight");
+        helper.assertTrue(sight.has("horizon") && sight.getAsJsonArray("horizon").size() == 8,
+                "Sight perception must expose 8-sector multi-chunk horizon: " + sight);
         helper.getLevel().getServer().getPlayerList().remove(bot);
         helper.succeed();
+    }
+
+    @GameTest(maxTicks = 200, skyAccess = true)
+    public void frontierExploreIgnoresZeroOriginSentinel(GameTestHelper helper) {
+        for (int x = 0; x < 16; x++) {
+            for (int z = 0; z < 5; z++) helper.setBlock(x, 1, z, Blocks.STONE);
+        }
+        ServerPlayer bot = LocalAiMod.spawn(helper.getLevel().getServer(), new com.mojang.authlib.GameProfile(
+                java.util.UUID.nameUUIDFromBytes("Willow_Frontier_Test".getBytes()), "Willow_Frontier"));
+        BlockPos start = helper.absolutePos(new BlockPos(2, 2, 2));
+        bot.teleportTo(helper.getLevel(), start.getX() + 0.5, start.getY(), start.getZ() + 0.5, Set.of(), -90.0f, 0.0f, true);
+        Actions actions = new Actions(bot);
+        helper.runAfterDelay(2, () -> actions.start(decision("explore", "", BlockPos.ZERO)));
+        helper.onEachTick(actions::tick);
+        helper.runAtTickTime(120, () -> {
+            String detail = actions.result().has("detail") ? actions.result().get("detail").getAsString() : "";
+            helper.assertFalse(detail.contains("Heading toward 0, 0, 0"),
+                    "Open explore (0,0,0) must never pull Willow toward world origin (0,0,0): " + actions.result());
+            helper.assertTrue(bot.blockPosition().distSqr(start) >= 16.0,
+                    "Frontier explore must smoothly traverse across the platform: " + bot.blockPosition() + " " + actions.result());
+            helper.getLevel().getServer().getPlayerList().remove(bot);
+            helper.succeed();
+        });
     }
 
     @GameTest
     public void layeredTerrain(GameTestHelper helper) {
         for (int x = 1; x <= 5; x++) helper.setBlock(x, 1, 2, Blocks.STONE);
+        helper.setBlock(4, 1, 2, Blocks.DIRT_PATH);
         helper.setBlock(2, 2, 2, Blocks.SNOW.defaultBlockState()
                 .setValue(net.minecraft.world.level.block.SnowLayerBlock.LAYERS, 4));
         helper.setBlock(3, 2, 2, Blocks.OAK_SLAB);
         BlockPos snow = helper.absolutePos(new BlockPos(2, 2, 2));
         BlockPos slab = helper.absolutePos(new BlockPos(3, 2, 2));
+        BlockPos dirtPath = helper.absolutePos(new BlockPos(4, 2, 2));
         helper.assertTrue(Navigator.safe(helper.getLevel(), snow), "Layered snow is walkable");
         helper.assertTrue(Navigator.safe(helper.getLevel(), slab), "Bottom slabs are walkable");
+        helper.assertTrue(Navigator.safe(helper.getLevel(), dirtPath), "Village dirt paths are walkable");
+        helper.assertTrue(SightPerception.GAZE_MAX_DISTANCE >= 96.0 && Navigator.MAX_SEARCH_RADIUS >= 64,
+                "Vision and navigation cover at least 4-6 chunks");
         helper.assertFalse(Navigator.find(helper.getLevel(), helper.absolutePos(new BlockPos(1, 2, 2)),
-                helper.absolutePos(new BlockPos(4, 2, 2))).isEmpty(), "Path crosses snow and slabs");
+                helper.absolutePos(new BlockPos(5, 2, 2))).isEmpty(), "Path crosses snow, slabs, and dirt paths");
         helper.setBlock(2, 2, 2, Blocks.POWDER_SNOW);
         helper.assertFalse(Navigator.safe(helper.getLevel(), snow), "Powder snow remains unsafe");
         helper.succeed();

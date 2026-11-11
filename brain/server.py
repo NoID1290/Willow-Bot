@@ -89,7 +89,7 @@ SCHEMA = {
 }
 SYSTEM = """You are Willow, an autonomous Minecraft survival player, not a chatbot.
 ACTIVE TOOLS:
-- active_tools.vision: seeing.looking_at (crosshair up to 12m), seeing.visible_entities (90° FOV with distance/bearing/LOS), seeing.retina (7x5 depth grid), seeing.visual_hazards (lava/hostiles).
+- active_tools.vision: seeing.looking_at (crosshair up to 96m / 6 chunks), seeing.visible_entities (130° FOV up to 64m / 4 chunks), seeing.distant_landmarks & seeing.horizon (5-chunk 360° landmarks & 8-sector terrain passability), seeing.retina (7x5 96m depth grid), seeing.visual_hazards.
 - active_tools.hearing: listening.recent_sounds and listening.active_alerts (3D sound bearings/distances; evade CRITICAL creeper hisses or explosions immediately).
 - active_tools.actions: explore, goto, run, sprint, jump, sneak, pillar, mine, craft, place, eat, attack, pickup, wait, escape, smelt, chest, sleep, trade, boat, tunnel, bridge, shelter, portal.
 DECISION & PLAN CHAINING:
@@ -676,15 +676,20 @@ def validate_action(decision, observation):
             and all(isinstance(v, (int, float)) for v in here)
             and max(abs(decision[k] - here[i]) for i, k in enumerate("xyz")) > goto_range
             and "explore" in allowed_actions(observation)):
+        sight_landmarks = (
+            (observation.get("seeing") or {}).get("distant_landmarks")
+            or (observation.get("sight") or {}).get("distant_landmarks")
+            or []
+        )
         known_coords = {
             tuple(item["at"])
-            for key in ("waypoints", "remembered_resources")
-            for item in (observation.get(key) or [])
+            for items in (observation.get("waypoints") or [], observation.get("remembered_resources") or [], sight_landmarks)
+            for item in items
             if isinstance(item, dict) and isinstance(item.get("at"), list) and len(item["at"]) == 3
         }
         # Guard against zero-axis coordinate hallucinations (e.g. x=0 when here[0]=-625, or [0,99,0])
         if tuple(dest) not in known_coords and (
-            (decision["x"] == 0 and abs(here[0]) > 64) or (decision["z"] == 0 and abs(here[2]) > 64)
+            (decision["x"] == 0 and abs(here[0]) > 80) or (decision["z"] == 0 and abs(here[2]) > 80)
         ):
             LOG.info("Clearing zero-axis coordinate hallucination %s near %s to local explore", dest, here)
             decision.update(action="explore", target="", x=0, y=0, z=0)
@@ -1869,15 +1874,22 @@ class Brain:
 
         # Explicit active tools declaration for tool awareness
         seeing_info = context.get("seeing") or {}
+        raw_sight_info = observation.get("sight") or {}
         listening_info = context.get("listening") or {}
+        landmarks = seeing_info.get("distant_landmarks") or raw_sight_info.get("distant_landmarks") or []
         active_tools = {
             "vision": {
                 "status": "online",
-                "looking_at": seeing_info.get("looking_at") or (observation.get("sight") or {}).get("looking_at"),
+                "looking_at": seeing_info.get("looking_at") or raw_sight_info.get("looking_at"),
                 "visible_entities": [
                     {"type": e.get("type"), "distance": e.get("distance"), "bearing": e.get("bearing")}
-                    for e in (seeing_info.get("visible_entities") or (observation.get("sight") or {}).get("visible_entities", []))[:6]
+                    for e in (seeing_info.get("visible_entities") or raw_sight_info.get("visible_entities", []))[:6]
                     if isinstance(e, dict)
+                ],
+                "distant_landmarks": [
+                    {"id": lm.get("id"), "distance": lm.get("distance"), "direction": lm.get("direction"), "at": lm.get("at")}
+                    for lm in landmarks[:6]
+                    if isinstance(lm, dict)
                 ],
                 "visual_hazards": seeing_info.get("visual_hazards", []),
             },
@@ -1963,8 +1975,12 @@ class Brain:
                     context["milestones"].pop("reminder", None)
                 if "terrain" in context and isinstance(context["terrain"], dict):
                     context["terrain"].pop("exits", None)
+                if "seeing" in context and isinstance(context["seeing"], dict):
+                    context["seeing"].pop("horizon", None)
+                    context["seeing"].pop("retina", None)
                 if "active_tools" in context and isinstance(context["active_tools"], dict):
                     context["active_tools"].get("vision", {}).pop("insight", None)
+                    context["active_tools"].get("vision", {}).pop("distant_landmarks", None)
                     context["active_tools"].get("hearing", {}).pop("insight", None)
                     context["active_tools"].pop("omni_synthesis", None)
                 context.pop("strategy", None)
@@ -2117,6 +2133,23 @@ class Brain:
                     break
             if chained:
                 decision["plan"] = chained
+
+        # 4. Steer undirected explore toward distant 4-5 chunk visual landmarks when resources aren't adjacent
+        if (from_actor and decision["action"] == "explore"
+                and [decision.get("x", 0), decision.get("y", 0), decision.get("z", 0)] == [0, 0, 0]):
+            landmarks = (
+                (observation.get("seeing") or {}).get("distant_landmarks")
+                or (observation.get("sight") or {}).get("distant_landmarks")
+                or []
+            )
+            wanted_cats = ("tree",) if needs_wood else (("stone", "ore") if (pickaxes > 0 and stone_picks == 0 and cobble < 3) else ())
+            for lm in landmarks:
+                if (isinstance(lm, dict) and lm.get("category") in wanted_cats
+                        and isinstance(lm.get("at"), list) and len(lm["at"]) == 3):
+                    decision["x"], decision["y"], decision["z"] = int(lm["at"][0]), int(lm["at"][1]), int(lm["at"][2])
+                    LOG.info("Directed open explore toward distant %s landmark %s at %s (%sm)",
+                             lm.get("category"), lm.get("id"), lm["at"], lm.get("distance"))
+                    break
         return decision
 
     def decide(self, observation):

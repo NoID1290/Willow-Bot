@@ -4,10 +4,14 @@ import carpet.fakes.ServerPlayerInterface;
 import carpet.helpers.EntityPlayerActionPack;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Deque;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -15,6 +19,7 @@ import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.ItemTags;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
@@ -27,6 +32,7 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.item.context.UseOnContext;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
@@ -66,10 +72,23 @@ final class Actions {
     private String trackedMainHandTool = "";
     private String currentGoal = "";
     private String lastSpeech = "";
+    private final Deque<BlockPos> visitedTrail = new ArrayDeque<>();
+    private Double exploreHeadingRad = null;
 
     Actions(ServerPlayer player) {
         this.player = player;
         navigator = new Navigator(player);
+        recordVisitedPosition();
+    }
+
+    private void recordVisitedPosition() {
+        BlockPos here = player.blockPosition().immutable();
+        if (visitedTrail.isEmpty() || visitedTrail.getLast().distSqr(here) >= 16.0) {
+            visitedTrail.addLast(here);
+            while (visitedTrail.size() > 32) {
+                visitedTrail.removeFirst();
+            }
+        }
     }
 
     EntityPlayerActionPack pack() {
@@ -233,15 +252,13 @@ final class Actions {
                 case "goto" -> {
                     BlockPos pos = new BlockPos(decision.get("x").getAsInt(),
                             decision.get("y").getAsInt(), decision.get("z").getAsInt());
-                    if (player.blockPosition().distManhattan(pos) > 48
-                            || Math.abs(pos.getX() - player.getX()) > 24
-                            || Math.abs(pos.getZ() - player.getZ()) > 24
+                    if (player.blockPosition().distManhattan(pos) > Navigator.MAX_MANHATTAN_RANGE
+                            || Math.abs(pos.getX() - player.getX()) > Navigator.MAX_SEARCH_RADIUS
+                            || Math.abs(pos.getZ() - player.getZ()) > Navigator.MAX_SEARCH_RADIUS
                             || !player.level().isLoaded(pos)) {
-                        explore(pos);
-                        recoveryMethod = "Global pathfinding step toward " + pos.toShortString();
-                    } else {
-                        walkTo(pos);
+                        throw new IllegalArgumentException("Coordinate outside local navigation range; use explore for long-range travel");
                     }
+                    walkTo(pos);
                 }
                 case "explore" -> {
                     BlockPos heading = headingOrZero(decision);
@@ -285,7 +302,7 @@ final class Actions {
                     }
                     Entity entity = player.level().getEntity(entityId);
                     if (!(entity instanceof LivingEntity) || entity instanceof Player
-                            || player.distanceToSqr(entity) > 144) {
+                            || player.distanceToSqr(entity) > 1600) {
                         throw new IllegalArgumentException("Target missing, too far away, or a player");
                     }
                     if (player.distanceToSqr(entity) > 8) approach(entity.blockPosition(), 2);
@@ -304,15 +321,23 @@ final class Actions {
 
     private BlockPos headingOrZero(JsonObject decision) {
         if (!hasCoordinates(decision)) return null;
-        return new BlockPos(decision.get("x").getAsInt(), decision.get("y").getAsInt(), decision.get("z").getAsInt());
+        int x = decision.get("x").getAsInt();
+        int y = decision.get("y").getAsInt();
+        int z = decision.get("z").getAsInt();
+        if (x == 0 && y == 0 && z == 0) return null;
+        return new BlockPos(x, y, z);
     }
 
     private BlockPos coordinatesOrZero(JsonObject decision) {
         if (!hasCoordinates(decision)) return null;
-        BlockPos pos = new BlockPos(decision.get("x").getAsInt(), decision.get("y").getAsInt(), decision.get("z").getAsInt());
-        if (player.blockPosition().distManhattan(pos) > 48
-                || Math.abs(pos.getX() - player.getX()) > 24
-                || Math.abs(pos.getZ() - player.getZ()) > 24
+        int x = decision.get("x").getAsInt();
+        int y = decision.get("y").getAsInt();
+        int z = decision.get("z").getAsInt();
+        if (x == 0 && y == 0 && z == 0) return null;
+        BlockPos pos = new BlockPos(x, y, z);
+        if (player.blockPosition().distManhattan(pos) > Navigator.MAX_MANHATTAN_RANGE
+                || Math.abs(pos.getX() - player.getX()) > Navigator.MAX_SEARCH_RADIUS
+                || Math.abs(pos.getZ() - player.getZ()) > Navigator.MAX_SEARCH_RADIUS
                 || !player.level().isLoaded(pos)) return null;
         return pos;
     }
@@ -334,6 +359,13 @@ final class Actions {
         if (navigator.go(pos)) {
             walking = true;
             return;
+        }
+        for (int dy : new int[]{1, -1, 2, -2}) {
+            BlockPos alt = pos.offset(0, dy, 0);
+            if (!alt.equals(player.blockPosition()) && Navigator.safe(player.level(), alt) && navigator.go(alt)) {
+                walking = true;
+                return;
+            }
         }
         try {
             approach(pos, 2, false);
@@ -386,26 +418,133 @@ final class Actions {
         return ticks < 40 && !item.isNoGravity() && !item.onGround() && item.getY() > player.getY();
     }
 
+    private List<BlockPos> candidateGroundAt(int tx, int tz, int baseY) {
+        List<BlockPos> candidates = new ArrayList<>();
+        BlockPos probe = new BlockPos(tx, baseY, tz);
+        if (!player.level().isLoaded(probe)) return candidates;
+
+        // 1. Check actual surface heightmap first when outdoors / near surface so hills & valleys work up to ±20m!
+        int surfaceY = player.level().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, tx, tz);
+        if (Math.abs(surfaceY - baseY) <= 22) {
+            for (int sy : new int[]{surfaceY, surfaceY + 1, surfaceY - 1}) {
+                BlockPos p = new BlockPos(tx, sy, tz);
+                if (Navigator.safe(player.level(), p)) {
+                    candidates.add(p);
+                }
+            }
+        }
+
+        // 2. Also check near current Y for caves, indoor floors, bridges, and elevated platforms
+        for (int dy : new int[]{0, 1, -1, 2, -2, 3, -3, 4, -4}) {
+            BlockPos p = new BlockPos(tx, baseY + dy, tz);
+            if (!candidates.contains(p) && Navigator.safe(player.level(), p)) {
+                candidates.add(p);
+            }
+        }
+        return candidates;
+    }
+
+    private double scoreFrontierAngle(double angle) {
+        BlockPos start = player.blockPosition();
+        double cos = Math.cos(angle);
+        double sin = Math.sin(angle);
+
+        // 1. Novelty: strongly penalize heading back toward any recently visited position!
+        double sampleX = start.getX() + cos * 30.0;
+        double sampleZ = start.getZ() + sin * 30.0;
+        double minVisitedDistSq = Double.MAX_VALUE;
+        for (BlockPos prev : visitedTrail) {
+            if (prev.equals(start)) continue;
+            double dx = sampleX - prev.getX();
+            double dz = sampleZ - prev.getZ();
+            minVisitedDistSq = Math.min(minVisitedDistSq, dx * dx + dz * dz);
+        }
+        double score = (minVisitedDistSq == Double.MAX_VALUE) ? 160.0 : Math.min(260.0, Math.sqrt(minVisitedDistSq) * 5.0);
+        if (minVisitedDistSq < 196.0) {
+            score -= 350.0; // Within 14m of an already-visited spot: avoid backtracking!
+        }
+
+        // 2. Sustained travel momentum so Willow walks naturally forward across chunks instead of spinning
+        if (exploreHeadingRad != null) {
+            score += 35.0 * Math.cos(angle - exploreHeadingRad);
+        }
+
+        // 3. Multi-chunk visual landmark attraction (steer toward distant trees/stone/ores/structures we need)
+        int logs = 0, planks = 0, pickaxes = 0, cobble = 0;
+        for (int i = 0; i < 36; i++) {
+            ItemStack st = player.getInventory().getItem(i);
+            if (st.isEmpty()) continue;
+            if (st.is(ItemTags.LOGS)) logs += st.getCount();
+            else if (st.is(ItemTags.PLANKS)) planks += st.getCount();
+            else if (st.is(ItemTags.PICKAXES)) pickaxes += st.getCount();
+            else if (st.is(Items.COBBLESTONE)) cobble += st.getCount();
+        }
+        boolean needsWood = (logs * 4 + planks < 12 && pickaxes == 0) || (logs == 0 && planks < 4);
+        boolean needsStone = pickaxes > 0 && cobble < 8;
+
+        for (SightPerception.LandmarkHit lm : sightPerception.recentLandmarks()) {
+            double lmAngle = Math.atan2(lm.pos().getZ() - player.getZ(), lm.pos().getX() - player.getX());
+            double align = Math.cos(angle - lmAngle);
+            if (align < 0.7) continue;
+            if ("structure".equals(lm.category())) score += 80.0 * align;
+            else if (needsWood && "tree".equals(lm.category())) score += 110.0 * align;
+            else if (needsStone && ("stone".equals(lm.category()) || "ore".equals(lm.category()))) score += 95.0 * align;
+            else if ("ore".equals(lm.category())) score += 55.0 * align;
+        }
+
+        // 4. Penalize open deep water or lava ahead at 20m and 36m
+        for (int probeDist : new int[]{20, 36}) {
+            int px = start.getX() + (int) Math.round(cos * probeDist);
+            int pz = start.getZ() + (int) Math.round(sin * probeDist);
+            BlockPos col = new BlockPos(px, start.getY(), pz);
+            if (!player.level().isLoaded(col)) continue;
+            int gy = player.level().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, px, pz);
+            var surface = player.level().getBlockState(new BlockPos(px, gy - 1, pz));
+            if (surface.is(Blocks.LAVA)) score -= 400.0;
+            else if (surface.is(Blocks.WATER)) score -= 90.0;
+        }
+
+        score += player.getRandom().nextDouble() * 12.0;
+        return score;
+    }
+
     private void explore(BlockPos heading) {
-        int offset = player.getRandom().nextInt(8);
+        recordVisitedPosition();
+        BlockPos start = player.blockPosition();
         List<Double> angles = new ArrayList<>();
-        for (int n = 0; n < 8; n++) angles.add((n + offset) * Math.PI / 4);
+
         if (heading != null) {
-            // Travel toward a far remembered destination: try the most aligned directions first.
+            // Travel toward a far remembered destination or distant landmark: try the most aligned directions first.
             double wanted = Math.atan2(heading.getZ() - player.getZ(), heading.getX() - player.getX());
-            angles.clear();
-            for (int n = 0; n < 8; n++) angles.add(wanted + n * Math.PI / 4);
+            for (int n = 0; n < 16; n++) {
+                angles.add(wanted + n * (Math.PI / 8.0));
+            }
             angles.sort(Comparator.comparingDouble(a -> Math.abs(Math.IEEEremainder(a - wanted, 2 * Math.PI))));
             recoveryMethod = "Heading toward " + heading.toShortString();
+        } else {
+            if (exploreHeadingRad == null) {
+                float yawRad = (float) Math.toRadians(player.getYRot());
+                exploreHeadingRad = Math.atan2(Math.cos(yawRad), -Math.sin(yawRad));
+            }
+            for (int n = 0; n < 16; n++) {
+                angles.add(n * (Math.PI / 8.0));
+            }
+            angles.sort(Comparator.comparingDouble(this::scoreFrontierAngle).reversed());
         }
+
+        int[] strideDistances = {44, 34, 26, 20, 15, 11, 7, 5};
         for (double angle : angles) {
-            for (int distance : new int[]{20, 16, 12, 8, 5}) {
-                for (int dy : new int[]{0, 1, -1, 2, -2, 3, -3}) {
-                    BlockPos destination = player.blockPosition().offset(
-                            (int) Math.round(Math.cos(angle) * distance), dy,
-                            (int) Math.round(Math.sin(angle) * distance));
-                    if (navigator.go(destination)) {
+            for (int distance : strideDistances) {
+                if (heading != null) {
+                    double toGoal = Math.hypot(heading.getX() - player.getX(), heading.getZ() - player.getZ());
+                    if (distance > Math.max(8.0, toGoal + 2.0)) continue;
+                }
+                int tx = start.getX() + (int) Math.round(Math.cos(angle) * distance);
+                int tz = start.getZ() + (int) Math.round(Math.sin(angle) * distance);
+                for (BlockPos destination : candidateGroundAt(tx, tz, start.getY())) {
+                    if (navigator.goIfReachable(destination, 3, true)) {
                         walking = true;
+                        exploreHeadingRad = angle;
                         return;
                     }
                 }
@@ -1444,6 +1583,7 @@ final class Actions {
         result.addProperty("health_after", player.getHealth());
         result.addProperty("damage", Math.max(0, healthBefore - player.getHealth()));
         result.addProperty("position", player.blockPosition().toShortString());
+        recordVisitedPosition();
         progress.record(action, status, player.blockPosition());
         LocalAiMod.LOG.info("Willow action {} {}: {}", action, status, detail);
         action = "";
@@ -1490,8 +1630,33 @@ final class Actions {
     private List<BlockPos> cachedNearbyBlocks = null;
     private JsonObject cachedNearbyWorkstations = null;
 
+    private static boolean isLongRangeValuableBlock(net.minecraft.world.level.block.state.BlockState state) {
+        return state.is(BlockTags.LOGS)
+                || state.is(Blocks.CRAFTING_TABLE)
+                || state.is(Blocks.FURNACE) || state.is(Blocks.BLAST_FURNACE) || state.is(Blocks.SMOKER)
+                || state.is(Blocks.CHEST) || state.is(Blocks.TRAPPED_CHEST) || state.is(Blocks.BARREL)
+                || state.is(BlockTags.BEDS)
+                || state.is(Blocks.NETHER_PORTAL) || state.is(Blocks.OBSIDIAN)
+                || state.is(Blocks.COAL_ORE) || state.is(Blocks.DEEPSLATE_COAL_ORE)
+                || state.is(Blocks.IRON_ORE) || state.is(Blocks.DEEPSLATE_IRON_ORE)
+                || state.is(Blocks.COPPER_ORE) || state.is(Blocks.DEEPSLATE_COPPER_ORE)
+                || state.is(Blocks.GOLD_ORE) || state.is(Blocks.EMERALD_ORE)
+                || state.is(Blocks.STONE) || state.is(Blocks.COBBLESTONE) || state.is(Blocks.HAY_BLOCK);
+    }
+
+    private boolean isBlockExposed(BlockPos pos) {
+        for (Direction direction : Direction.values()) {
+            var adj = player.level().getBlockState(pos.relative(direction));
+            if (adj.isAir() || adj.is(BlockTags.LEAVES) || adj.canBeReplaced()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void scanNearbyBlocksAndWorkstations() {
         List<BlockPos> blocks = new ArrayList<>();
+        Set<BlockPos> addedPositions = new HashSet<>();
         JsonObject stations = new JsonObject();
         BlockPos center = player.blockPosition();
         int ox = center.getX();
@@ -1503,11 +1668,8 @@ final class Actions {
         double bestBed = Double.MAX_VALUE;
         double bestPortal = Double.MAX_VALUE;
 
-        int minX = -16, maxX = 16;
-        int minZ = -16, maxZ = 16;
-        int minY = -5, maxY = 6;
-
-        for (BlockPos pos : BlockPos.betweenClosed(center.offset(minX, minY, minZ), center.offset(maxX, maxY, maxZ))) {
+        // 1. Detailed 3D local scan (-16..16, -5..7, -16..16)
+        for (BlockPos pos : BlockPos.betweenClosed(center.offset(-16, -5, -16), center.offset(16, 7, 16))) {
             if (!player.level().isLoaded(pos)) continue;
             var state = player.level().getBlockState(pos);
             if (state.isAir()) continue;
@@ -1515,10 +1677,9 @@ final class Actions {
             int dx = pos.getX() - ox;
             int dy = pos.getY() - oy;
             int dz = pos.getZ() - oz;
+            double dSq = dx * dx + dy * dy + dz * dz;
 
-            // Check workstations (-16..16, -4..4, -16..16)
-            if (dy >= -4 && dy <= 4) {
-                double dSq = dx * dx + dy * dy + dz * dz;
+            if (dy >= -5 && dy <= 6) {
                 if (state.is(Blocks.CRAFTING_TABLE) && dSq < bestTable) {
                     bestTable = dSq;
                     stations.add("crafting_table", posJson(pos));
@@ -1537,29 +1698,116 @@ final class Actions {
                 }
             }
 
-            // Check nearby blocks (-12..12, -5..6, -12..12)
-            if (dx >= -12 && dx <= 12 && dz >= -12 && dz <= 12 && dy >= -5 && dy <= 6) {
+            if (dx >= -14 && dx <= 14 && dz >= -14 && dz <= 14) {
                 if (state.getFluidState().isEmpty()) {
                     if (!(state.is(BlockTags.LEAVES) && pos.distManhattan(center) > 2)) {
                         String id = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
                         if (!isNonResourceGroundFoliage(id) || pos.equals(center) || pos.equals(center.above())) {
-                            boolean exposed = false;
-                            for (Direction direction : Direction.values()) {
-                                var adj = player.level().getBlockState(pos.relative(direction));
-                                if (adj.isAir() || adj.is(BlockTags.LEAVES) || adj.canBeReplaced()) {
-                                    exposed = true;
-                                    break;
+                            if (isBlockExposed(pos)) {
+                                BlockPos imm = pos.immutable();
+                                if (addedPositions.add(imm)) {
+                                    blocks.add(imm);
                                 }
                             }
-                            if (exposed) blocks.add(pos.immutable());
                         }
                     }
                 }
             }
         }
+
+        // 2. Multi-chunk heightmap & canopy ring scan (16..64 blocks = 4 full chunks!)
+        for (int ring = 17; ring <= 64; ring += 3) {
+            int step = ring <= 38 ? 3 : 4;
+            for (int d = -ring; d <= ring; d += step) {
+                scanDistantColumn(ox + d, oz - ring, center, addedPositions, blocks, stations,
+                        bestTable, bestFurnace, bestChest, bestBed, bestPortal);
+                scanDistantColumn(ox + d, oz + ring, center, addedPositions, blocks, stations,
+                        bestTable, bestFurnace, bestChest, bestBed, bestPortal);
+                if (Math.abs(d) < ring) {
+                    scanDistantColumn(ox - ring, oz + d, center, addedPositions, blocks, stations,
+                            bestTable, bestFurnace, bestChest, bestBed, bestPortal);
+                    scanDistantColumn(ox + ring, oz + d, center, addedPositions, blocks, stations,
+                            bestTable, bestFurnace, bestChest, bestBed, bestPortal);
+                }
+                if (stations.has("crafting_table")) bestTable = Math.min(bestTable, distSqrJson(stations.getAsJsonArray("crafting_table"), center));
+                if (stations.has("furnace")) bestFurnace = Math.min(bestFurnace, distSqrJson(stations.getAsJsonArray("furnace"), center));
+                if (stations.has("chest")) bestChest = Math.min(bestChest, distSqrJson(stations.getAsJsonArray("chest"), center));
+                if (stations.has("bed")) bestBed = Math.min(bestBed, distSqrJson(stations.getAsJsonArray("bed"), center));
+                if (stations.has("nether_portal")) bestPortal = Math.min(bestPortal, distSqrJson(stations.getAsJsonArray("nether_portal"), center));
+            }
+        }
+
         blocks.sort(Comparator.comparingDouble(p -> p.distSqr(center)));
         cachedNearbyBlocks = blocks;
         cachedNearbyWorkstations = stations;
+    }
+
+    private static double distSqrJson(JsonArray arr, BlockPos center) {
+        if (arr == null || arr.size() != 3) return Double.MAX_VALUE;
+        double dx = arr.get(0).getAsInt() - center.getX();
+        double dy = arr.get(1).getAsInt() - center.getY();
+        double dz = arr.get(2).getAsInt() - center.getZ();
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private void scanDistantColumn(int x, int z, BlockPos center, Set<BlockPos> addedPositions,
+                                   List<BlockPos> blocks, JsonObject stations,
+                                   double bestTable, double bestFurnace, double bestChest,
+                                   double bestBed, double bestPortal) {
+        BlockPos col = new BlockPos(x, center.getY(), z);
+        if (!player.level().isLoaded(col)) return;
+
+        int motionY = player.level().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+        int worldY = player.level().getHeight(Heightmap.Types.WORLD_SURFACE, x, z);
+        if (Math.abs(motionY - center.getY()) > 26) return;
+
+        for (int y : new int[]{motionY - 2, motionY - 1, motionY, motionY + 1}) {
+            BlockPos p = new BlockPos(x, y, z);
+            var state = player.level().getBlockState(p);
+            if (state.isAir() || !state.getFluidState().isEmpty()) continue;
+            registerDistantCandidate(p, state, center, addedPositions, blocks, stations,
+                    bestTable, bestFurnace, bestChest, bestBed, bestPortal);
+        }
+
+        // Under leaf canopies (worldY > motionY + 1), inspect column + 4 cardinal neighbors for tree trunks!
+        if (worldY > motionY + 1) {
+            for (int[] off : new int[][]{{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}}) {
+                BlockPos tp = new BlockPos(x + off[0], motionY, z + off[1]);
+                if (!player.level().isLoaded(tp)) continue;
+                for (int dy = 0; dy <= 3; dy++) {
+                    BlockPos logPos = tp.above(dy);
+                    var ts = player.level().getBlockState(logPos);
+                    if (ts.is(BlockTags.LOGS)) {
+                        if (addedPositions.add(logPos)) {
+                            blocks.add(logPos);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    private void registerDistantCandidate(BlockPos pos, net.minecraft.world.level.block.state.BlockState state,
+                                          BlockPos center, Set<BlockPos> addedPositions, List<BlockPos> blocks,
+                                          JsonObject stations, double bestTable, double bestFurnace,
+                                          double bestChest, double bestBed, double bestPortal) {
+        if (!isLongRangeValuableBlock(state)) return;
+        double dSq = pos.distSqr(center);
+        if (state.is(Blocks.CRAFTING_TABLE) && dSq < bestTable) {
+            stations.add("crafting_table", posJson(pos));
+        } else if ((state.is(Blocks.FURNACE) || state.is(Blocks.BLAST_FURNACE) || state.is(Blocks.SMOKER)) && dSq < bestFurnace) {
+            stations.add("furnace", posJson(pos));
+        } else if ((state.is(Blocks.CHEST) || state.is(Blocks.TRAPPED_CHEST) || state.is(Blocks.BARREL)) && dSq < bestChest) {
+            stations.add("chest", posJson(pos));
+        } else if (state.is(BlockTags.BEDS) && dSq < bestBed) {
+            stations.add("bed", posJson(pos));
+        } else if (state.is(Blocks.NETHER_PORTAL) && dSq < bestPortal) {
+            stations.add("nether_portal", posJson(pos));
+        }
+        if (isBlockExposed(pos) && addedPositions.add(pos)) {
+            blocks.add(pos);
+        }
     }
 
     List<BlockPos> nearbyBlocks() {
@@ -1570,9 +1818,13 @@ final class Actions {
     }
 
     List<Entity> nearbyEntities() {
-        var entities = new ArrayList<>(player.level().getEntities(player, player.getBoundingBox().inflate(12),
+        var entities = new ArrayList<>(player.level().getEntities(player, player.getBoundingBox().inflate(40, 20, 40),
                 e -> e instanceof LivingEntity || e instanceof ItemEntity));
-        entities.sort(Comparator.comparingDouble(player::distanceToSqr));
+        entities.sort(Comparator.comparingInt((Entity e) -> {
+            if (e instanceof Monster && player.distanceToSqr(e) <= 256) return 0;
+            if (e instanceof ItemEntity && player.distanceToSqr(e) <= 256) return 1;
+            return 2;
+        }).thenComparingDouble(player::distanceToSqr));
         return entities;
     }
 

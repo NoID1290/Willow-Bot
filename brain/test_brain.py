@@ -803,6 +803,33 @@ class BrainTests(unittest.TestCase):
         msgs = self.brain.messages(obs, role="actor")
         self.assertLessEqual(len(json.dumps(msgs).encode()), 4500)
 
+    def test_multi_chunk_goto_and_distant_landmark_steering(self):
+        obs = {
+            "position": [100, 64, 100],
+            "health": 20,
+            "food": 20,
+            "dimension": "minecraft:overworld",
+            "inventory": [],
+            "nearby_blocks": [],
+            "entities": [],
+            "craftable": [],
+            "sight": {
+                "looking_at": {"id": "minecraft:oak_log", "distance": 74.0},
+                "distant_landmarks": [
+                    {"id": "minecraft:oak_log", "category": "tree", "distance": 74.0, "direction": "East", "at": [174, 65, 102]}
+                ],
+            },
+        }
+        # 4-chunk (56-block) goto stays a direct goto rather than falling back to explore
+        four_chunk_goto = validate_action(decision(action="goto", x=156, y=64, z=112), obs)
+        self.assertEqual((four_chunk_goto["action"], four_chunk_goto["x"], four_chunk_goto["z"]), ("goto", 156, 112))
+
+        # Open explore (0,0,0) steers toward 5-chunk distant tree landmark when wood is needed
+        with patch.object(self.brain, "inference", return_value=decision(action="explore", x=0, y=0, z=0)):
+            dec = self.brain.decide(obs)
+        self.assertEqual(dec["action"], "explore")
+        self.assertEqual([dec["x"], dec["y"], dec["z"]], [174, 65, 102])
+
 
 if __name__ == "__main__":
     unittest.main()

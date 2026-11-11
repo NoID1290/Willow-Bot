@@ -12,7 +12,7 @@ from hardware_opt.llm_client import CancellationToken, NONE_TOKEN
 from hardware_opt.memory_pool import MemoryPoolManager
 from rl_rewards.telemetry_snapshot import BlockInfo, Vector3, matches_item_pattern
 
-MAX_SCAN_RADIUS = 32
+MAX_SCAN_RADIUS = 64
 MAX_PATH_TIME_SLICE_NS = 2_500_000  # Strict 2.5 ms per tick budget
 
 

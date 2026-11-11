@@ -46,7 +46,7 @@ DECISION_LIMITS = {
 }
 
 GAMEPLAY_LIMITS = {
-    "goto_max_range": 24,
+    "goto_max_range": 64,
     "goto_min_distance": 2,
     "danger_food": 14,
     "danger_health": 8.0,

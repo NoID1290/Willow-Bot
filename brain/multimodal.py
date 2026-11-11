@@ -188,15 +188,24 @@ class VisionProcessor(threading.Thread):
     def _analyze_vision(self, sight, obs):
         analyzed = dict(sight)
         looking_at = sight.get("looking_at", {})
-        hazards = []
-        if looking_at.get("id") == "minecraft:lava":
+        hazards = list(sight.get("visual_hazards") or [])
+        if looking_at.get("id") == "minecraft:lava" and "Lava directly in crosshairs" not in hazards:
             hazards.append("Lava directly in crosshairs")
 
+        for lm in sight.get("distant_landmarks", []):
+            if isinstance(lm, dict) and lm.get("id") == "minecraft:lava" and float(lm.get("distance", 99)) <= 14.0:
+                msg = f"Lava pool {lm.get('distance')}m {lm.get('direction', 'ahead')}"
+                if msg not in hazards:
+                    hazards.append(msg)
+                break
+
         visible_entities = sight.get("visible_entities", [])
-        threats = [e for e in visible_entities if e.get("hostile") and e.get("distance", 99) < 8.0]
+        threats = [e for e in visible_entities if isinstance(e, dict) and e.get("hostile") and e.get("distance", 99) < 16.0]
         if threats:
             closest = min(threats, key=lambda e: e.get("distance", 99))
-            hazards.append(f"Hostile {closest.get('type', 'mob')} visible at {closest.get('distance')}m ({closest.get('bearing')})")
+            msg = f"Hostile {closest.get('type', 'mob')} visible at {closest.get('distance')}m ({closest.get('bearing')})"
+            if msg not in hazards:
+                hazards.append(msg)
 
         analyzed["visual_hazards"] = hazards
         return analyzed
@@ -515,7 +524,14 @@ class ConcurrentPipeline:
         obs_hearing = context.get("hearing")
         obs_doing = context.get("doing")
 
-        seeing = obs_sight if obs_sight else snap["seeing"]
+        if isinstance(obs_sight, dict) and obs_sight:
+            seeing = self.vision._analyze_vision(obs_sight, context)
+            prev_seeing = snap.get("seeing") or {}
+            for k in ("vision_insight", "lfm_vision_insight"):
+                if k not in seeing and prev_seeing.get(k):
+                    seeing[k] = prev_seeing[k]
+        else:
+            seeing = snap["seeing"]
         listening = obs_hearing if obs_hearing else snap["listening"]
         doing = obs_doing if obs_doing else snap["doing"]
 
